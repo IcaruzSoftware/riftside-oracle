@@ -217,16 +217,16 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Courtside Oracle — generated files (regenerate locally, do not commit)
+# Riftside Oracle — generated files (regenerate locally, do not commit)
 # NOTE: ignore the *contents* of the data dirs (dir/*), not the dirs themselves,
 # so the committed "live state" files below can be re-included with `!`.
 # (git cannot re-include a file whose parent directory is itself ignored.)
 src/data/raw/*
 src/data/processed/*
-!src/data/raw/game_log_*.csv
-!src/data/raw/player_season_stats_*.csv
+!src/data/raw/team_games_*.csv
 !src/data/processed/player_elo_current.parquet
 !src/data/processed/player_elo_recent.parquet
+!src/data/processed/role_norms.json
 src/models/*.pkl
 !src/models/xgb_model.pkl
 
