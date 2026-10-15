@@ -15,8 +15,9 @@ sys.path.insert(0, str(SRC))
 # ---------------------------------------------------------------------------
 
 class _Result:
-    def __init__(self, data):
+    def __init__(self, data, count=None):
         self.data = data
+        self.count = count
 
 
 class _Query:
@@ -28,9 +29,11 @@ class _Query:
         self.on_conflict = None
         self.filters = []
         self._negate = False
+        self.count = None
+        self.head = False
 
-    def select(self, cols="*"):
-        self.kind, self.cols = "select", cols
+    def select(self, cols="*", count=None, head=None):
+        self.kind, self.cols, self.count, self.head = "select", cols, count, bool(head)
         return self
 
     @property
@@ -44,6 +47,10 @@ class _Query:
 
     def eq(self, col, val):
         self.filters.append(("eq", col, val, self._negate)); self._negate = False
+        return self
+
+    def gte(self, col, val):
+        self.filters.append(("gte", col, val, self._negate)); self._negate = False
         return self
 
     def update(self, payload):
@@ -68,6 +75,8 @@ class _Query:
                 ok = row.get(col) is None
             elif kind == "eq":
                 ok = row.get(col) == val
+            elif kind == "gte":
+                ok = row.get(col) is not None and str(row.get(col)) >= str(val)
             else:
                 ok = True
             if neg:
@@ -80,7 +89,8 @@ class _Query:
         t = self.t
         if self.kind == "select":
             rows = [r for r in t.rows if self._match(r)]
-            return _Result([dict(r) for r in rows])
+            return _Result([] if self.head else [dict(r) for r in rows],
+                           len(rows) if self.count == "exact" else None)
         if self.kind == "update":
             for r in t.rows:
                 if self._match(r):

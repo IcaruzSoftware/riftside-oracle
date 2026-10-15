@@ -1,310 +1,178 @@
 """
-Daily state update — replaces update_season.py.
+Daily state update: Oracle's Elixir (OE) -> team_games_{year}.csv + incremental ELO.
 
-Brings the committed live state up to date from the NBA CDN (no proxies, no full
-historical dataset on the runner):
+  1. Download the OE year file(s) covering (last game in team_games - LOOKBACK_DAYS)
+     through the target date (early January: both years).
+  2. New games = gameids not in team_games_*.csv, dated strictly BEFORE the target
+     day (UTC). Same-day games wait for the next run, so the ELO state never holds
+     day d while live features cut team_games at day < d.
+  3. Keep only complete games (12 rows, 5 roles per side, results present); an
+     incomplete one is logged and skipped, and a later run picks it up.
+  4. elo.update_elo on exactly those games, then append their team rows to
+     team_games_{year}.csv (year of the game's date). ELO goes first: if the append
+     fails, the next run hands the same games to update_elo, which skips them.
 
-  1. Find completed stateful games (regular season / playoffs / play-in / Cup final)
-     on the ET dates from the last logged game through the target date that are not
-     already in the committed game logs.
-  2. Fetch each CDN box score, append both team rows to that season's game-log CSV,
-     and fold the per-player lines into that season's player_season_stats CSV.
-  3. Run incremental ELO on those games (elo.update_elo).
-  4. Preseason games only refresh each player's team assignment (no ELO change).
-  5. All-star games are ignored entirely.
+Idempotent: a second run finds no new games and writes nothing. --dry-run writes
+no state (the OE download still lands in the gitignored src/data/raw/oe/ cache).
+A blocked OE download (Drive "Quota exceeded") raises with a clear message; the
+committed state stays as it was and the next run catches up via the lookback.
 
-Idempotent: games already in the game logs are skipped, cached files are only ever
-appended to after a successful fetch (never deleted first), and update_elo skips
-games already reflected in the ELO state. Catches up over multiple missed days.
+One-time setup: --init writes team_games_{year}.csv from the local OE files (the
+same files the committed ELO state was built from).
 
 Run
 ---
-  python src/pipeline/daily_state.py                 # catch up through today (ET)
+  python src/pipeline/daily_state.py                 # catch up through yesterday (UTC)
   python src/pipeline/daily_state.py --date 2026-11-05
   python src/pipeline/daily_state.py --dry-run
+  python src/pipeline/daily_state.py --init          # one-time, from src/data/raw/oe/
 """
 
 import argparse
 import logging
 import sys
-from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import requests
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pipeline import nba_cdn
+from pipeline import elo, oe
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-RAW_DIR = Path(__file__).parent.parent / "data" / "raw"
-
-# Re-scan a few days before the last logged game so a game that had no box score on
-# its own day (but whose later neighbours got logged) is still picked up. The
-# existing-game filter prevents re-doing games already in the logs.
-LOOKBACK_DAYS = 7
-
-GAME_LOG_COLS = ["GAME_ID", "GAME_DATE", "TEAM_ID", "TEAM_ABBREVIATION", "MATCHUP",
-                 "WL", "PTS", "PLUS_MINUS", "AST", "REB", "TOV"]
+RAW_DIR = oe.RAW_DIR
+LOOKBACK_DAYS = 14
+_STR_COLS = [c for c in oe._STR_COLS if c in oe.TEAM_GAMES_COLS] + ["starters"]
 
 
-# ---------------------------------------------------------------------------
-# Date / season helpers
-# ---------------------------------------------------------------------------
-
-def _today_et() -> str:
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+def team_games_path(year: int) -> Path:
+    return RAW_DIR / f"team_games_{year}.csv"
 
 
-def _date_to_season(date: str) -> str:
-    ts = pd.to_datetime(date)
-    y = ts.year
-    return f"{y}-{str(y + 1)[2:]}" if ts.month >= 10 else f"{y - 1}-{str(y)[2:]}"
+def load_team_games() -> pd.DataFrame:
+    """All committed team_games_*.csv rows (oe.TEAM_GAMES_COLS), ids and patch kept as str."""
+    paths = sorted(RAW_DIR.glob("team_games_*.csv"))
+    if not paths:
+        raise FileNotFoundError(f"No team_games_*.csv in {RAW_DIR} - run daily_state.py --init once")
+    df = pd.concat([pd.read_csv(p, dtype={c: str for c in _STR_COLS}, parse_dates=["date"])
+                    for p in paths], ignore_index=True)
+    return df[oe.TEAM_GAMES_COLS]
 
 
-def _slug(game_id: str) -> str:
-    return "playoffs" if nba_cdn.game_prefix(game_id) == "004" else "regular"
+def complete_gameids(rows: pd.DataFrame) -> set:
+    """Gameids with exactly 12 rows, 2 team rows, 5 roles per side and every result present."""
+    players = rows[rows["position"] != "team"]
+    roles_ok = (players.groupby(["gameid", "side"])["position"].agg(lambda s: "|".join(sorted(s)))
+                == "|".join(sorted(oe.ROLES)))
+    g = (rows.assign(is_team=rows["position"].eq("team"), no_result=rows["result"].isna())
+         .groupby("gameid").agg(n=("is_team", "size"), teams=("is_team", "sum"),
+                                no_result=("no_result", "sum")))
+    g["sides_ok"] = roles_ok.groupby(level="gameid").sum().reindex(g.index, fill_value=0)
+    return set(g.index[(g["n"] == 12) & (g["teams"] == 2) & (g["no_result"] == 0)
+                       & (g["sides_ok"] == 2)])
 
 
-def _date_range(start: str, end: str) -> list[str]:
-    s, e = pd.to_datetime(start), pd.to_datetime(end)
-    if s > e:
-        s = e
-    return [d.strftime("%Y-%m-%d") for d in pd.date_range(s, e, freq="D")]
-
-
-# ---------------------------------------------------------------------------
-# Existing state
-# ---------------------------------------------------------------------------
-
-def _game_log_frames() -> list[pd.DataFrame]:
-    return [pd.read_csv(f) for f in sorted(RAW_DIR.glob("game_log_*.csv"))]
-
-
-def _existing_game_ids() -> set[str]:
-    ids: set[str] = set()
-    for df in _game_log_frames():
-        if "GAME_ID" in df.columns:
-            ids.update(df["GAME_ID"].astype(str).str.zfill(10))
-    return ids
-
-
-def _last_logged_date() -> str | None:
-    latest = None
-    for df in _game_log_frames():
-        if "GAME_DATE" in df.columns and not df.empty:
-            d = pd.to_datetime(df["GAME_DATE"]).max()
-            latest = d if latest is None else max(latest, d)
-    return latest.strftime("%Y-%m-%d") if latest is not None else None
-
-
-# ---------------------------------------------------------------------------
-# CDN box score -> rows
-# ---------------------------------------------------------------------------
-
-def _game_log_rows(game: dict, game_id: str, game_date: str) -> list[dict]:
-    home, away = game["homeTeam"], game["awayTeam"]
-    h_ab, a_ab = home["teamTricode"], away["teamTricode"]
-    h_pts, a_pts = home["score"], away["score"]
-
-    def _row(team, matchup, pts, opp_pts):
-        st = team.get("statistics", {}) or {}
-        return {
-            "GAME_ID":           game_id,
-            "GAME_DATE":         game_date,
-            "TEAM_ID":           int(team["teamId"]),
-            "TEAM_ABBREVIATION": team["teamTricode"],
-            "MATCHUP":           matchup,
-            "WL":                "W" if pts > opp_pts else "L",
-            "PTS":               pts,
-            "PLUS_MINUS":        pts - opp_pts,
-            "AST":               st.get("assists"),
-            "REB":               st.get("reboundsTotal"),
-            "TOV":               st.get("turnovers"),
-        }
-
-    return [
-        _row(home, f"{h_ab} vs. {a_ab}", h_pts, a_pts),
-        _row(away, f"{a_ab} @ {h_ab}",   a_pts, h_pts),
-    ]
-
-
-def _player_contribs(game: dict) -> list[tuple[str, int, float, str]]:
-    """(player_id, team_id, points, player_name) for every player who logged minutes."""
-    from pipeline.elo import _parse_iso_minutes
-
-    out: list[tuple[str, int, float, str]] = []
-    for team in (game["homeTeam"], game["awayTeam"]):
-        tid = int(team["teamId"])
-        for p in team.get("players", []):
-            st = p.get("statistics", {}) or {}
-            if _parse_iso_minutes(st.get("minutes")) <= 0:
-                continue
-            name = p.get("name") or f"{p.get('firstName', '')} {p.get('familyName', '')}".strip()
-            out.append((str(p["personId"]), tid, float(st.get("points", 0)), name))
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Writers (append-only, idempotent)
-# ---------------------------------------------------------------------------
-
-def _append_game_logs(rows_by_file: dict, dry_run: bool) -> None:
-    for (slug, season), rows in rows_by_file.items():
-        path = RAW_DIR / f"game_log_{slug}_{season}.csv"
-        new = pd.DataFrame(rows, columns=GAME_LOG_COLS)
-        if path.exists():
-            old = pd.read_csv(path)
-            combined = pd.concat([old, new], ignore_index=True)
-        else:
-            combined = new
-        combined["GAME_ID"] = combined["GAME_ID"].astype(str).str.zfill(10)
-        combined = combined.drop_duplicates(subset=["GAME_ID", "TEAM_ID"], keep="first")
+def _append(team: pd.DataFrame, dry_run: bool) -> None:
+    """Append team rows to team_games_{year}.csv by the year of each game's date."""
+    for year, rows in team.groupby(team["date"].dt.year):
+        path = team_games_path(int(year))
         if dry_run:
-            logger.info("[dry-run] %s: +%d row(s) -> %d total", path.name, len(new), len(combined))
-        else:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            combined.to_csv(path, index=False)
-            logger.info("Wrote %s (%d rows)", path.name, len(combined))
+            logger.info("[dry-run] %s: +%d row(s)", path.name, len(rows))
+            continue
+        # Fixed date_format: an all-midnight batch would otherwise be written date-only.
+        rows.to_csv(path, mode="a", header=not path.exists(), index=False, lineterminator="\n",
+                    date_format="%Y-%m-%d %H:%M:%S")
+        logger.info("Appended %d row(s) to %s", len(rows), path.name)
 
 
-def _update_player_stats(season: str, contribs: list[tuple[str, int, float, str]], dry_run: bool) -> None:
-    if not contribs:
-        return
-    path = RAW_DIR / f"player_season_stats_{season}.csv"
-
-    agg: dict[int, list] = {}
-    for pid, tid, pts, name in contribs:
-        a = agg.setdefault(int(pid), [0.0, 0, tid, ""])
-        a[0] += pts
-        a[1] += 1
-        a[2] = tid
-        a[3] = name or a[3]
-
-    if path.exists():
-        df = pd.read_csv(path)
-        df["PLAYER_ID"] = df["PLAYER_ID"].astype(int)
-        df = df.set_index("PLAYER_ID")
-    else:
-        df = pd.DataFrame(columns=["PLAYER_NAME", "TEAM_ID", "GP", "PTS"])
-        df.index.name = "PLAYER_ID"
-
-    for pid, (pts_sum, gp, tid, name) in agg.items():
-        if pid in df.index and "GP" in df.columns and pd.notna(df.at[pid, "GP"]):
-            old_gp  = float(df.at[pid, "GP"])
-            old_ppg = float(df.at[pid, "PTS"])
-            new_gp  = old_gp + gp
-            df.at[pid, "GP"]      = new_gp
-            df.at[pid, "PTS"]     = round((old_ppg * old_gp + pts_sum) / new_gp, 4)
-            df.at[pid, "TEAM_ID"] = tid
-            if name:
-                df.at[pid, "PLAYER_NAME"] = name
-        else:
-            df.loc[pid, "PLAYER_NAME"] = name
-            df.loc[pid, "TEAM_ID"]     = tid
-            df.loc[pid, "GP"]          = gp
-            df.loc[pid, "PTS"]         = round(pts_sum / gp, 4)
-
-    df = df.reset_index()
-    if dry_run:
-        logger.info("[dry-run] %s: %d player line(s) updated", path.name, len(agg))
-    else:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(path, index=False)
-        logger.info("Wrote %s (%d players)", path.name, len(df))
-
-
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
-
-def run(date: str | None = None, dry_run: bool = False, schedule: dict | None = None) -> list[str]:
-    """Catch the committed state up through ``date`` (ET, defaults to today). Returns
-    the list of newly-applied stateful game IDs."""
-    et_target = date or _today_et()
-    if schedule is None:
-        schedule = nba_cdn.fetch_schedule()
-
-    existing = _existing_game_ids()
-    last = _last_logged_date()
-    if last is not None:
-        start = (pd.to_datetime(last) - pd.Timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
-    else:
-        start = et_target
-    dates = _date_range(start, et_target)
-    logger.info("Scanning %s..%s (%d day(s)) for completed games", dates[0], dates[-1], len(dates))
-
-    stateful_boxes: dict[str, dict] = {}   # game_id -> game dict
-    stateful_dates: dict[str, str]  = {}
-    preseason_boxes: dict[str, dict] = {}
-    preseason_dates: dict[str, str]  = {}
-
-    for d in dates:
-        for g in nba_cdn.games_for_date(d, schedule):
-            gid = g["game_id"]
-            if g["game_status"] != 3 or nba_cdn.is_all_star(gid):
+def _download(years: range) -> pd.DataFrame:
+    """Download (or reuse the fresh cache of) the OE files for these years and load them."""
+    try:
+        files = oe.list_files()
+        frames = []
+        for y in years:
+            if y not in files:
+                logger.info("OE %d: no file in the folder yet, skipping", y)
                 continue
-            if nba_cdn.is_preseason(gid):
-                box = nba_cdn.fetch_boxscore(gid)
-                if box:
-                    preseason_boxes[gid] = box
-                    preseason_dates[gid] = d
-                continue
-            if not nba_cdn.is_stateful(gid) or gid in existing:
-                continue
-            box = nba_cdn.fetch_boxscore(gid)
-            if not box:
-                logger.info("  %s: box score not available yet", gid)
-                continue
-            stateful_boxes[gid] = box
-            stateful_dates[gid] = d
+            oe.download_year(y, file_id=files[y])
+            frames.append(oe.load_year(y))
+    except (requests.exceptions.RequestException, RuntimeError) as exc:
+        raise RuntimeError(
+            f"OE download failed ({exc}). State NOT updated; predictions use the committed "
+            f"state, and the next run catches up (lookback {LOOKBACK_DAYS} days).") from exc
+    if not frames:
+        raise RuntimeError(f"OE: no file for any of the years {list(years)}")
+    return pd.concat(frames, ignore_index=True)
 
-    if not stateful_boxes and not preseason_boxes:
-        logger.info("State already up to date — nothing to apply.")
+
+def run(date: str | None = None, dry_run: bool = False) -> list[str]:
+    """
+    Catch the committed state up through the day before `date` (UTC 'YYYY-MM-DD',
+    default today). Returns the newly applied gameids in (date, gameid) order.
+    """
+    target = pd.Timestamp(date or datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    tg = load_team_games()
+    start = tg["date"].max().normalize() - pd.Timedelta(days=LOOKBACK_DAYS)
+    logger.info("Scanning OE %s..%s (games before %s)", start.date(), target.date(), target.date())
+
+    raw = _download(range(start.year, target.year + 1))
+    rows = raw[(raw["date"] >= start) & (raw["date"] < target) & ~raw["gameid"].isin(set(tg["gameid"]))]
+    ok = complete_gameids(rows)
+    for gid in sorted(set(rows["gameid"]) - ok):
+        logger.warning("  %s: incomplete game (rows/roles/result), skipped for now", gid)
+    new = rows[rows["gameid"].isin(ok)]
+    if new.empty:
+        logger.info("State already up to date - nothing to apply.")
         return []
 
-    # 1. game logs + player season stats
-    rows_by_file: dict = defaultdict(list)
-    contribs_by_season: dict = defaultdict(list)
-    for gid, box in stateful_boxes.items():
-        d = stateful_dates[gid]
-        season = _date_to_season(d)
-        rows_by_file[(_slug(gid), season)].extend(_game_log_rows(box, gid, d))
-        contribs_by_season[season].extend(_player_contribs(box))
-    _append_game_logs(rows_by_file, dry_run)
-    for season, contribs in contribs_by_season.items():
-        _update_player_stats(season, contribs, dry_run)
+    team = oe.team_rows(new)
+    gids = list(dict.fromkeys(team["gameid"]))
+    if dry_run:
+        logger.info("[dry-run] would apply update_elo to %d game(s) (%s..%s)", len(gids),
+                    team["date"].min().date(), team["date"].max().date())
+    else:
+        elo.update_elo(new)
+    _append(team, dry_run)
+    logger.info("Applied %d new game(s)%s.", len(gids), " [dry-run]" if dry_run else "")
+    return gids
 
-    from pipeline.elo import load_cdn_game_players, update_elo, update_team_assignments
 
-    # 2. incremental ELO on new stateful games (reuse already-fetched box scores)
-    if stateful_boxes:
-        games = [(gid, stateful_dates[gid]) for gid in stateful_boxes]
-        if dry_run:
-            logger.info("[dry-run] would apply update_elo to %d game(s)", len(games))
-        else:
-            update_elo(games, loader=lambda g: load_cdn_game_players(stateful_boxes.get(g)))
-
-    # 3. preseason: refresh player -> team assignment only
-    if preseason_boxes:
-        games = [(gid, preseason_dates[gid]) for gid in preseason_boxes]
-        if dry_run:
-            logger.info("[dry-run] would refresh team assignment for %d preseason game(s)", len(games))
-        else:
-            update_team_assignments(games, loader=lambda g: load_cdn_game_players(preseason_boxes.get(g)))
-
-    logger.info("Applied %d stateful game(s), %d preseason game(s)%s.",
-                len(stateful_boxes), len(preseason_boxes), " [dry-run]" if dry_run else "")
-    return list(stateful_boxes.keys())
+def init_team_games() -> dict[int, int]:
+    """
+    One-time: write team_games_{year}.csv from every local OE file (complete games
+    only, as run() would ingest them). Refuses to overwrite existing files.
+    Returns {year: rows written}.
+    """
+    existing = sorted(RAW_DIR.glob("team_games_*.csv"))
+    if existing:
+        raise FileExistsError(f"{existing[0].name} exists - delete the team_games files to re-init")
+    years = sorted(int(f.name[:4]) for f in oe.OE_DIR.glob("*_LoL_esports_match_data_from_OraclesElixir.csv"))
+    if not years:
+        raise FileNotFoundError(f"No OE year files in {oe.OE_DIR} - run bootstrap_data.py")
+    frames = []
+    for y in years:
+        df = oe.load_year(y)
+        ok = complete_gameids(df)
+        logger.info("OE %d: %d games, %d complete", y, df["gameid"].nunique(), len(ok))
+        frames.append(oe.team_rows(df[df["gameid"].isin(ok)]))
+    team = pd.concat(frames, ignore_index=True).sort_values(["date", "gameid", "side"], kind="stable")
+    _append(team, dry_run=False)
+    return {int(y): len(r) for y, r in team.groupby(team["date"].dt.year)}
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Daily CDN-driven state + ELO update")
-    parser.add_argument("--date", help="Target ET date YYYY-MM-DD (default: today)")
+    parser = argparse.ArgumentParser(description="Daily OE-driven state + ELO update")
+    parser.add_argument("--date", help="Target UTC date YYYY-MM-DD (default: today); "
+                                       "games before this day are ingested")
     parser.add_argument("--dry-run", action="store_true", help="Print instead of writing")
+    parser.add_argument("--init", action="store_true",
+                        help="One-time: write team_games_*.csv from the local OE files")
     args = parser.parse_args()
-    run(date=args.date, dry_run=args.dry_run)
+    if args.init:
+        print(init_team_games())
+    else:
+        run(date=args.date, dry_run=args.dry_run)

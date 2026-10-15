@@ -1,34 +1,42 @@
 """
-Check prediction results and update Supabase.
+Resolve predictions against lolesports results and update Supabase.
 
-Run the morning after games complete:
   SUPABASE_URL=... SUPABASE_KEY=... python src/pipeline/evaluate.py
   python src/pipeline/evaluate.py --dry-run     # print, don't write
 
 What it does:
-  1. Fetches predictions from Supabase where actual_winner is NULL
-  2. Pulls final results from the NBA CDN box score (never stats.nba.com game logs)
-  3. Marks each prediction correct/wrong + stores actual_winner
-  4. Recomputes the running_record over predictions from RECORD_START onward, so the
-     retroactively-seeded 2026 Finals rows (seed_finals.py) are excluded.
+  1. Fetches predictions with actual_winner NULL whose start_time_utc has passed.
+  2. getEventDetails per match: the winner is the team with result.outcome "win",
+     else the team whose gameWins reached ceil(best_of / 2) (getEventDetails only
+     carries gameWins). Sets actual_winner (team code), score ("team1-team2" game
+     wins, e.g. "3-1") and correct.
+  3. Still unresolved UNRESOLVED_WARN_DAYS after the start (postponed, forfeited):
+     warning only; nothing auto-voids.
+  4. Recomputes the series-level running_record over match_date >= RECORD_START on
+     every run.
+A match whose lookup raises is logged and skipped; the others still resolve, the
+record is still recomputed, and evaluate() raises once at the end.
 """
 
 import argparse
 import logging
+import math
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+from pipeline import lolesports
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# The running record counts only predictions from the current season onward. The
-# 2026 Finals rows seeded by seed_finals.py have earlier game_dates and are excluded.
-RECORD_START = "2026-10-01"
+# The public running record counts only predictions from the launch date onward.
+RECORD_START = "2026-10-15"
+UNRESOLVED_WARN_DAYS = 7
 
 
 def _get_supabase():
@@ -40,75 +48,84 @@ def _get_supabase():
     return create_client(url, key)
 
 
-def _fetch_results_cdn(game_ids: list[str]) -> dict[str, str]:
-    """Return {game_id: winning_team_tricode} for games that are final on the CDN."""
-    from pipeline.nba_cdn import fetch_boxscore
+def match_result(event: dict | None) -> tuple[str, str] | None:
+    """
+    (winning team code, "team1-team2" game wins) from getEventDetails, or None if
+    undecided. A None event (unknown/removed match id: data.event is null) is undecided.
+    """
+    if event is None:
+        return None
+    teams = event["match"]["teams"]
+    results = [t.get("result") or {} for t in teams]
+    wins = [r.get("gameWins") or 0 for r in results]
+    need = math.ceil(event["match"]["strategy"]["count"] / 2)
+    for t, r, w in zip(teams, results, wins):
+        if r.get("outcome") == "win" or w >= need:
+            return t["code"], f"{wins[0]}-{wins[1]}"
+    return None
 
-    results: dict[str, str] = {}
-    for gid in game_ids:
-        game = fetch_boxscore(gid)
-        if not game or game.get("gameStatus") != 3:
-            continue
-        home, away = game.get("homeTeam", {}), game.get("awayTeam", {})
-        hs, as_ = home.get("score"), away.get("score")
-        if hs is None or as_ is None:
-            continue
-        results[gid] = home["teamTricode"] if hs > as_ else away["teamTricode"]
-    return results
 
-
-def evaluate(dry_run: bool = False, db=None) -> None:
+def evaluate(dry_run: bool = False, db=None, now: datetime | None = None) -> None:
     if db is None:
         if not (os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_KEY")):
             if dry_run:
-                logger.info("Supabase not configured — dry run has nothing to evaluate.")
+                logger.info("Supabase not configured - dry run has nothing to evaluate.")
                 return
             raise EnvironmentError("SUPABASE_URL and SUPABASE_KEY must be set.")
         db = _get_supabase()
+    now = now or datetime.now(timezone.utc)
 
-    # All predictions without a result yet
     pending = (db.table("predictions").select("*").is_("actual_winner", "null").execute().data) or []
-    if not pending:
-        logger.info("No pending predictions to evaluate.")
-    else:
-        logger.info("Evaluating %d pending prediction(s)%s...",
-                    len(pending), " [dry-run]" if dry_run else "")
-        results = _fetch_results_cdn([p["game_id"] for p in pending])
-        updated = 0
-        for pred in pending:
-            actual = results.get(pred["game_id"])
-            if actual is None:
-                logger.info("  %s — result not available yet", pred["game_id"])
-                continue
-            correct = (pred["predicted_team"] == actual)
-            logger.info(
-                "  %s @ %s  predicted: %s  actual: %s  %s%s",
-                pred.get("away_team"), pred.get("home_team"),
-                pred["predicted_team"], actual,
-                "CORRECT" if correct else "WRONG",
-                " [dry-run]" if dry_run else "",
-            )
-            if not dry_run:
-                db.table("predictions").update({
-                    "actual_winner": actual,
-                    "correct":       correct,
-                }).eq("game_id", pred["game_id"]).execute()
-            updated += 1
-        if updated == 0:
-            logger.info("No completed games found yet.")
+    started = [p for p in pending if datetime.fromisoformat(p["start_time_utc"]) < now]
+    logger.info("Evaluating %d started, unresolved prediction(s)%s...", len(started),
+                " [dry-run]" if dry_run else "")
+    failed = []
+    for pred in started:
+        try:
+            _resolve(db, pred, now, dry_run)
+        except Exception as exc:        # one bad match must not block the others
+            logger.warning("  %s: evaluation failed: %s", pred.get("match_id"), exc)
+            failed.append(pred.get("match_id"))
 
     # Recompute the running record on every run, so the site reflects the correct
-    # (RECORD_START-onward) tally even on days with nothing to grade.
+    # (RECORD_START-onward) tally even on days with nothing to resolve.
     _recompute_running_record(db, dry_run)
+    if failed:
+        raise RuntimeError(f"evaluation failed for {len(failed)} match(es): {', '.join(map(str, failed))}")
+
+
+def _resolve(db, pred: dict, now: datetime, dry_run: bool) -> None:
+    """Resolve one started prediction from getEventDetails, or log why it stays open."""
+    result = match_result(lolesports.get_event_details(pred["match_id"]))
+    label = f"{pred['team1_code']} vs {pred['team2_code']} ({pred['match_id']})"
+    if result is None:
+        if now - datetime.fromisoformat(pred["start_time_utc"]) > timedelta(days=UNRESOLVED_WARN_DAYS):
+            logger.warning("  %s still unresolved %d+ days after its start", label,
+                           UNRESOLVED_WARN_DAYS)
+        else:
+            logger.info("  %s - result not available yet", label)
+        return
+    winner, score = result
+    correct = pred["predicted_team"] == winner
+    logger.info("  %s  predicted %s  actual %s %s  %s%s", label, pred["predicted_team"],
+                winner, score, "CORRECT" if correct else "WRONG", " [dry-run]" if dry_run else "")
+    if not dry_run:
+        db.table("predictions").update({"actual_winner": winner, "score": score,
+                                        "correct": correct}).eq("match_id", pred["match_id"]).execute()
 
 
 def _recompute_running_record(db, dry_run: bool) -> None:
-    """Recompute + upsert running_record over resolved predictions from RECORD_START."""
-    rows = (db.table("predictions").select("correct,game_date")
-              .not_.is_("correct", "null").execute().data) or []
-    counted          = [r for r in rows if str(r["game_date"]) >= RECORD_START]
-    total_correct    = sum(1 for r in counted if r["correct"])
-    total_incorrect  = sum(1 for r in counted if not r["correct"])
+    """
+    Recompute + upsert running_record over resolved predictions from RECORD_START.
+    Counted server-side (count="exact", no rows returned): a plain select would stop
+    at Supabase's 1000-row default and undercount.
+    """
+    def count(correct: bool) -> int:
+        return (db.table("predictions").select("id", count="exact", head=True)
+                .gte("match_date", RECORD_START).eq("correct", correct).execute().count) or 0
+
+    total_correct    = count(True)
+    total_incorrect  = count(False)
     total            = total_correct + total_incorrect
     accuracy         = round(total_correct / total, 4) if total > 0 else None
 
@@ -128,7 +145,7 @@ def _recompute_running_record(db, dry_run: bool) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate predictions against CDN results")
+    parser = argparse.ArgumentParser(description="Resolve predictions against lolesports results")
     parser.add_argument("--dry-run", action="store_true", help="Print instead of writing to Supabase")
     args = parser.parse_args()
     evaluate(dry_run=args.dry_run)

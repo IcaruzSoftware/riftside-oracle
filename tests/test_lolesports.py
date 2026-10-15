@@ -46,9 +46,14 @@ def test_get_event_details_returns_event(monkeypatch):
 @pytest.mark.parametrize("name, expected", [
     ("Anubis Gaming", "anubis"), ("Gen.G Esports", "geng"), ("T1", "t1"),
     ("Team", "team"), ("Team Secret Whales", "teamsecretwhales"),
+    ("T1 Esports Academy", "t1esportsacademy"),
 ])
 def test_normalize_team_name(name, expected):
     assert lolesports.normalize_team_name(name) == expected
+
+
+def test_academy_is_a_separate_team():
+    assert lolesports.normalize_team_name("T1 Esports Academy") != lolesports.normalize_team_name("T1")
 
 
 # ---------------------------------------------------------------------------

@@ -6,13 +6,14 @@ disagree, this file records a later decision and wins.
 
 ## TL;DR
 
-- **Phases 0–3 of the handover are done, plus one model-improvement round.** Each one is committed, tested and was reviewed by two independent reviewers.
-- **Next step: Phase 4**, the daily pipeline (`daily_state.py`, `predict.py`, `evaluate.py`, `daily_run.py`, the workflows).
+- **Phases 0–4 of the handover are done, plus one model-improvement round.** Each one is committed, tested and was reviewed by two independent reviewers.
+- **Next step: Phase 5**, the web app (§8.2 of RIFTSIDE_HANDOVER.md). `schema.sql` is already done (see decision 12). Then Phase 6 (docs).
+- **The daily pipeline works:** `daily_state.py`, `predict.py`, `evaluate.py` and `daily_run.py` are LoL code now, no longer broken NBA code. 91 tests, all passing.
+- **The workflows are still disabled on GitHub.** The owner enables them once the secrets are set (see open point 4).
 - **Model quality, at the level that matters to the owner (who wins the match):**
   - about **70% series accuracy** on the test period 2025-05-20..2026-10-14: 6,260 series across all leagues;
   - **69.9% on the major leagues**: 1,453 series; 72.7% in Bo3s.
 - **Verdict after the improvement round: it is good as it is.** The remaining headroom is small and not reachable with the data we have (see "Model", below).
-- **Still broken:** `daily_state.py`, `predict.py`, `evaluate.py` and `daily_run.py` are NBA code with broken imports. That is expected; Phase 4 rewrites them.
 
 ## Resume on another PC
 
@@ -20,15 +21,16 @@ disagree, this file records a later decision and wins.
 git clone https://github.com/IcaruzSoftware/riftside-oracle.git && cd riftside-oracle
 uv venv --python 3.12 .venv          # Python 3.12 is required (pins don't install on 3.13+)
 uv pip install --python .venv/bin/python -r requirements.txt pytest
-.venv/bin/python -m pytest           # 57 tests, all must pass
+.venv/bin/python -m pytest           # 91 tests, all must pass
 ```
 
 - **Raw data is not in git.** The Oracle's Elixir CSVs (13 files, ~856 MB) are gitignored.
   - Download them **by hand** from the Drive folder <https://drive.google.com/drive/folders/1gLSw0RLjBbtaNy0dgnGQDAZOHIgCe-HH> into `src/data/raw/oe/`.
   - Keep the original names, e.g. `2026_LoL_esports_match_data_from_OraclesElixir.csv`.
   - `bootstrap_data.py` can do the same, but Drive often blocks scripted full downloads (see "Data access", below).
-- **Committed state:** `player_elo_current.parquet`, `player_elo_recent.parquet`, `role_norms.json` and `src/models/xgb_model.pkl`.
-  - With these, the tests and future live predictions work without the raw data.
+- **Committed state:** `player_elo_current.parquet`, `player_elo_recent.parquet`, `role_norms.json`, `src/models/xgb_model.pkl` and `team_games_{2014..2026}.csv`.
+  - The `team_games` CSVs are committed state too (102,870 games, ~79 MB in total, largest file ~10 MB). `daily_state` writes them; do not hand-edit.
+  - With these, the tests and live predictions work without the raw data.
   - Rebuilding the history or retraining needs the raw data.
 - **Rebuild commands** (only when needed):
 
@@ -36,12 +38,14 @@ uv pip install --python .venv/bin/python -r requirements.txt pytest
   .venv/bin/python src/pipeline/elo.py --force            # ~21 s, full 2014–2026 ELO replay
   .venv/bin/python src/pipeline/build_dataset.py --force  # ~35–65 s, 93,753 games since 2017
   .venv/bin/python src/pipeline/train.py --trials 100 --force   # ~25–40 min
+  .venv/bin/python src/pipeline/daily_state.py --init     # regenerate team_games_*.csv from the local OE files
   ```
 
+- **Local Windows note (2026-10-15 PC):** `uv` was not installed, so the venv was made with `py -3.12 -m venv`. pyarrow 26 is blocked by Windows Application Control on this PC, so `.venv` has `pyarrow==21.0.0` installed by hand. `requirements.txt` is unchanged and CI is unaffected.
 - **GitHub state:**
   - The repo is pushed.
   - `check_sources.yml` passed on a GitHub runner, so OE and lolesports need no proxies.
-  - `Daily Evaluate`, `Daily Predictions` and `Keepalive` are **disabled** on GitHub until Phase 4 is done. Keepalive re-enables the others, which is why it is off too.
+  - `Daily Evaluate`, `Daily Predictions` and `Keepalive` are **disabled** on GitHub until the owner has set the secrets. Keepalive re-enables the others, which is why it is off too.
 
 ## Commits so far
 
@@ -52,7 +56,8 @@ uv pip install --python .venv/bin/python -r requirements.txt pytest
 | c9008de | Phase 1: data layer: OE download/load/split, lolesports schedule/results/team resolution |
 | 47b92b0 | Phase 2: player ELO (5 role-normalised skills + outcome ELO) |
 | ee312df | Phase 3: features, dataset, training, baseline gate |
-| (this push) | Improvement round: refined outcome ELO, Optuna fix, committed state + model, this file |
+| 0435478, 3ee0afc, bebc2b6 | Improvement round: refined outcome ELO, Optuna fix, committed state + model, this file |
+| (this commit) | Phase 4: daily pipeline (`daily_state`, `predict`, `evaluate`, `daily_run`), workflows, `team_games_*.csv`, `schema.sql` |
 
 ## Decisions made (by the owner or with the owner's OK) and deviations from the spec
 
@@ -75,6 +80,38 @@ uv pip install --python .venv/bin/python -r requirements.txt pytest
    - `NEW_K_MULT = 2` for a player's first 20 games. Games between new and established players are therefore **not zero-sum**; this is documented in `elo.py`.
 6. **`train.py`:** the Optuna CV now runs on the **train slice only** (Courtside used train+calibration) and minimises log loss instead of maximising AUC.
 7. **Git history:** this repo contains courtside-oracle's full history, merged with `--allow-unrelated-histories`.
+8. **Drive quota: option A (Phase 4).** There is no Drive API path. A blocked download makes the state update fail loudly.
+   - Evaluate and predict still run; predict uses the committed state; the run exits 1.
+   - The next day's run catches up through `LOOKBACK_DAYS = 14`.
+9. **`player_elo_recent.parquet` is committed in full every day**, with no pruning.
+10. **`academy` was removed from `lolesports._SUFFIXES`**, because academy teams are separate teams.
+11. **`RECORD_START = "2026-10-15"`** in `evaluate.py`.
+12. **`schema.sql` was updated in Phase 4**, ahead of the spec's Phase 5, so the owner could create the Supabase project now.
+    - §8.1 `predictions` table; `model_metadata` dropped; `shap_values` and `running_record` unchanged.
+
+## Phase 4: implementation choices
+
+- **`team_games_{2014..2026}.csv`** were generated once with `daily_state.py --init` from the local OE files.
+  - 102,870 games, ~79 MB in total, largest file ~10 MB.
+  - They match the committed ELO state exactly.
+  - 14 minor-league games are in team_games but not in the ELO, because none of their players has a `playerid`.
+- **`daily_state` ingestion:**
+  - It only ingests games dated strictly before the target day (UTC); same-day games wait for the next run.
+  - Only gameids that are new to team_games reach `update_elo`, and the ELO update runs before the CSV append.
+- **Live `playoffs` context:** 1 when the league is domestic and the lolesports `blockName` matches `playoff|final|knockout|play.?in`; internationals are always 0.
+- **`evaluate`:**
+  - The winner comes from `gameWins` reaching ⌈bo/2⌉, because live `getEventDetails` has no `outcome`. `score` is in team1-team2 order.
+  - Each match is isolated; an unknown id (event null) counts as unresolved.
+  - `running_record` is counted server-side (avoids the 1000-row cap).
+- **`predict`:**
+  - Each match is isolated.
+  - SHAP uses XGBoost's own `pred_contribs` (same values as the `shap` package, much faster to import; `shap` is still in `requirements.txt`).
+  - The ad-hoc CLI takes team **names**.
+  - 11 aliases were added to `team_aliases.csv`. All 56 teams in the current `PREDICT_LEAGUES` schedule resolve.
+- **Workflows:**
+  - evaluate runs on cron `45 7 * * *` and commits state even if evaluate itself failed;
+  - predict runs on `workflow_run` with any conclusion, plus crons `0 3` and `0 15`;
+  - bot `riftside-oracle[bot]`; `NBA_PROXIES` removed.
 
 ## Model: results and what was tried
 
@@ -151,6 +188,7 @@ Method: walk-forward validation over 3 windows (2021-07..2025-05, all before the
   - Dates are not sorted within a file; always sort.
   - The `year` column can say 2027 inside the 2026 file; use `date`.
   - 3 games have both sides marked as losers, and 12 have the same teamid on both sides. Both are handled.
+  - OE refreshes around 07:05 UTC.
 
 ## Data access
 
@@ -158,39 +196,36 @@ Method: walk-forward validation over 3 windows (2021-07..2025-05, all before the
   - We do **not** chunk around the quota with Range requests. That would get around Google's limit.
   - `oe.py --check` now starts a real download, so it detects the block.
   - OE's old S3 mirror is gone (404).
-- **Risk for Phase 4:** the daily job downloads the current year's file (~78 MB) every morning. If the quota block is common, the daily job fails.
-  - Fix A: retry later, since the block lifts within 24 h.
-  - Fix B, recommended: a Google Drive API v3 download path with the owner's own API key, stored as a GitHub secret.
-  - Decide this early in Phase 4. The owner hasn't decided yet.
+- **Daily job:** it downloads the current year's file (~78 MB) every morning. Decision 8 covers a blocked download: fail loudly, still evaluate and predict on the committed state, catch up the next day.
 - **lolesports API:** works with the public site key and needs no proxy.
 
-## Open points for Phase 4 and later
+## Open points for Phase 5 and later
 
-1. **Initial `team_games_*.csv`:** these files don't exist yet. Phase 4 must write them once from OE with `oe.team_rows` (one file per year), then let `daily_state` append. Features in live mode read them.
-2. **Idempotency:** `daily_state` must pass **only new games** to `elo.update_elo` (new = `gameid` not in `team_games_*.csv`). `update_elo`'s own check uses the recent snapshots, which miss games older than a player's last 11.
-3. **Live context mapping:** `build_feature_matrix` needs `context={"league": <OE code>, "playoffs": 0/1}`. Map lolesports slugs to OE codes, e.g. lck→LCK, worlds→WLDs, first_stand→FST, lcs→LCS, cblol-brazil→CBLOL, lcp→LCP. `playoffs` can come from the lolesports `blockName`.
-4. **Timing:** features in live mode use ELO from `player_elo_current` but cut team_games at day < d. Phase 4 must not ingest same-day results before predicting that day, or the ELO would include day d while the rolling stats don't.
-5. **Daily commit size:** `player_elo_recent.parquet` is 4.2 MB and is committed daily, about 1.5 GB of git history per year.
-   - Option: keep only players active in the last 365 days, which gives 1.1 MB.
-   - Ask the owner. I suggested it but it isn't decided.
-6. **Open question from Phase 1:** the team-name suffix list in `lolesports.normalize_team_name` includes `academy` (from the spec). So "T1 Esports Academy" and "T1" normalise the same, and T1 can come out as *ambiguous* and get skipped. It fails safe, nothing is guessed wrong.
-   - My recommendation: drop `academy` from the list. The owner hasn't answered yet.
-7. **Known small issues (nits):**
+1. **Known small issues (nits):**
    - `league_tier` is 1350 for internationals (`is_international` distinguishes them).
    - `mov_mult` treats comebacks as dominant wins.
    - A side with a missing playerid gets a partial gold-diff sum.
    - The pull is skipped for a year if a player's first game of that year is international (rare).
    - An empty starter slot is excluded from team means in training but filled with the init value live.
-8. **For Phase 6 docs** (`docs/model.md`; still NBA text, which also contradicts the new Optuna setup):
+2. **Known limitations of Phase 4, accepted:**
+   - The playoffs `blockName` rule disagrees with OE in some leagues: "Regional Qualifier" is 1 in OE for LCK and LCP, and "Play-Ins" is 0 in OE for CBLOL and LCP. The effect on the side-neutral p is small.
+   - Forfeits (0-0 `gameWins`) never resolve automatically; they get only the 7-day warning.
+   - A rare double write failure (`player_elo_current` written but `recent` not) could double-count games on the next run.
+   - The evaluate `pending` select is unpaged; this only matters with more than 1000 unresolved predictions at once.
+   - LCK/LPL matches between about 05:00 and 09:00 UTC are predicted on state that is missing the previous day, because OE refreshes around 07:05 UTC. This is by design.
+   - On days with the Drive quota block, the evaluate run will show as failed.
+3. **For Phase 6 docs** (`docs/model.md`; still NBA text, which also contradicts the new Optuna setup):
    - About 1.1% of games belong to series that cross UTC midnight. In training, their later games see the earlier ones; live prediction doesn't.
    - The roster train/live difference (training uses actual lineups, live the last-known lineup).
    - `role_norms` are computed over 2022–2025.
-9. **Odd but plausible ELO observations:**
+   - `team_games_*.csv` are committed state written by `daily_state`.
+4. **Owner-only steps** (spec §10):
+   - Done: the Supabase project is created and `schema.sql` has been run.
+   - Still to do: set the GitHub secrets `SUPABASE_URL` and `SUPABASE_KEY` (service-role); enable the workflows; set up the Plesk subdomain (Phase 5).
+5. **Odd but plausible ELO observations:**
    - The mean outcome ELO of players whose last game was in LPL (≈1615) is below LEC (≈1690). One reason: many stars' last game is currently Worlds.
    - Two EMEA Masters players reach the overall outcome top 10 (~1920).
    - Ratings drift up slowly over the years (≈1450 → 1520).
-10. **`RECORD_START`** in `evaluate.py` is still the NBA value. Set it to the launch date (the plan is the first 2027 major-league match day).
-11. **Owner-only steps** (spec §10): create a new Supabase project and run `schema.sql`; set the secrets; set up the Plesk subdomain; enable the workflows after Phase 4.
 
 ## How this was worked (for the next session)
 

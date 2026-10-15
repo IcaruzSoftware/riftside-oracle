@@ -2,7 +2,7 @@ name: Daily Evaluate
 
 on:
   schedule:
-    - cron: "0 7 * * *"   # 3:00 AM ET (2:00 AM in winter/EST), 07:00 UTC, after West Coast games are final — GitHub often starts scheduled runs hours late, which is fine here
+    - cron: "45 7 * * *"   # 07:45 UTC, after Oracle's Elixir's ~07:05 UTC refresh — GitHub often starts scheduled runs late, which is fine here
   workflow_dispatch:
 
 permissions:
@@ -25,17 +25,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Evaluate results + update state (CDN box scores, incremental ELO)
+      # Exits non-zero if evaluate or the state update failed (e.g. Drive's OE quota
+      # block), so the run shows as failed; both are always attempted.
+      - name: Evaluate results + update state (OE download, incremental ELO)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          NBA_PROXIES:  ${{ secrets.NBA_PROXIES }}
         run: python src/scripts/daily_run.py --evaluate
 
+      # Also after a failed step above: if only evaluate failed, the state update
+      # still succeeded and must be committed.
       - name: Commit updated state files if changed
+        if: success() || failure()
         run: |
-          git config user.name  "courtside-oracle[bot]"
-          git config user.email "bot@courtside-oracle"
+          git config user.name  "riftside-oracle[bot]"
+          git config user.email "bot@riftside-oracle"
           # `git add src/data/` stages only the committed state files — .gitignore
           # ignores everything else under data/ (see .gitignore negations).
           git add src/data/

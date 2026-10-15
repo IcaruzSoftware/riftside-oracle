@@ -1,12 +1,14 @@
 name: Daily Predictions
 
 on:
-  # Runs after Daily Evaluate finishes (any conclusion — a failed evaluate still
-  # predicts, on possibly day-old state) so it always sees the latest committed
-  # state; not a cron, so no scheduler delay.
+  # Runs after Daily Evaluate finishes with any conclusion — a failed evaluate (e.g.
+  # Drive blocked the OE download) still predicts, on the previous committed state.
   workflow_run:
     workflows: ["Daily Evaluate"]
     types: [completed]
+  schedule:
+    - cron: "0 3 * * *"    # safety net for early-UTC matches if evaluate runs late (uses yesterday's state)
+    - cron: "0 15 * * *"   # picks up bracket matches whose TBD teams resolved during the day
   workflow_dispatch:        # allow manual trigger from GitHub UI
 
 jobs:
@@ -30,9 +32,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Fetch today's schedule + predict
+      - name: Fetch the lolesports schedule + predict the next 36h
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          NBA_PROXIES:  ${{ secrets.NBA_PROXIES }}
         run: python src/scripts/daily_run.py --predict

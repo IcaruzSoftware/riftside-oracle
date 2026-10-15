@@ -1,31 +1,35 @@
--- Courtside Oracle — Supabase schema
+-- Riftside Oracle — Supabase schema
 -- Run this once in the Supabase SQL editor to set up all tables.
 -- Enable Row Level Security per table as appropriate for your access patterns.
 
 -- ---------------------------------------------------------------------------
 -- predictions
--- One row per game per day. "correct" is NULL until evaluate.py runs.
+-- One row per lolesports match (series). actual_winner/score/correct are NULL
+-- until evaluate.py resolves the match.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS predictions (
-    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    game_id          TEXT NOT NULL UNIQUE,
-    game_date        DATE NOT NULL,
-    game_time_utc    TIMESTAMPTZ,     -- scheduled tip-off (UTC), from the NBA schedule
-    home_team        TEXT NOT NULL,   -- team abbreviation, e.g. "LAL"
-    away_team        TEXT NOT NULL,
-    home_team_id     TEXT,            -- NBA team ID for logo URL
-    away_team_id     TEXT,
-    predicted_winner TEXT NOT NULL CHECK (predicted_winner IN ('home', 'away')),
-    predicted_team   TEXT NOT NULL,   -- abbreviation of predicted winning team
-    home_win_prob    NUMERIC(5, 4),   -- e.g. 0.6290
-    away_win_prob    NUMERIC(5, 4),
-    confidence       NUMERIC(5, 4) NOT NULL CHECK (confidence BETWEEN 0 AND 1),
-    actual_winner    TEXT,            -- abbreviation, NULL until game is played
-    correct          BOOLEAN,         -- NULL until result is known
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    match_id           TEXT NOT NULL UNIQUE,      -- lolesports match id
+    league_slug        TEXT NOT NULL,             -- e.g. "lck"
+    league_name        TEXT NOT NULL,
+    block_name         TEXT,                      -- e.g. "Playoffs", "Week 3"
+    start_time_utc     TIMESTAMPTZ NOT NULL,
+    match_date         DATE NOT NULL,             -- UTC date of start_time_utc
+    best_of            SMALLINT NOT NULL CHECK (best_of IN (1, 3, 5)),
+    team1_code TEXT NOT NULL, team1_name TEXT NOT NULL, team1_image TEXT,
+    team2_code TEXT NOT NULL, team2_name TEXT NOT NULL, team2_image TEXT,
+    team1_game_prob    NUMERIC(5, 4) NOT NULL,    -- side-neutral per-game p
+    team1_series_prob  NUMERIC(5, 4) NOT NULL,
+    team2_series_prob  NUMERIC(5, 4) NOT NULL,
+    predicted_team     TEXT NOT NULL,             -- team code
+    confidence         NUMERIC(5, 4) NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+    actual_winner      TEXT,                      -- team code, NULL until resolved
+    score              TEXT,                      -- team1-team2 game wins, e.g. "3-1"
+    correct            BOOLEAN,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_predictions_game_date ON predictions (game_date DESC);
+CREATE INDEX IF NOT EXISTS idx_predictions_match_date ON predictions (match_date DESC);
 CREATE INDEX IF NOT EXISTS idx_predictions_correct    ON predictions (correct);
 
 -- ---------------------------------------------------------------------------
@@ -35,8 +39,8 @@ CREATE INDEX IF NOT EXISTS idx_predictions_correct    ON predictions (correct);
 CREATE TABLE IF NOT EXISTS shap_values (
     id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     prediction_id  UUID NOT NULL REFERENCES predictions (id) ON DELETE CASCADE,
-    feature_name   TEXT NOT NULL,     -- human-readable, e.g. "Home Team Rest Days"
-    shap_value     NUMERIC NOT NULL,  -- positive = pushes toward home win
+    feature_name   TEXT NOT NULL,     -- model feature, e.g. "diff_outcome_elo"
+    shap_value     NUMERIC NOT NULL,  -- positive = pushes toward team1
     feature_value  NUMERIC           -- raw feature value for display context
 );
 
@@ -61,42 +65,20 @@ VALUES (1, 0, 0, NULL)
 ON CONFLICT (id) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
--- model_metadata
--- One row per trained model version. Append-only — never overwrite.
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS model_metadata (
-    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    model_version       TEXT NOT NULL,
-    trained_on_date     DATE NOT NULL,
-    seasons_covered     TEXT,             -- e.g. "2000-01 through 2023-24"
-    accuracy_on_test    NUMERIC(5, 4),
-    auc_roc             NUMERIC(5, 4),
-    brier_score         NUMERIC(5, 4),
-    feature_list        JSONB,            -- array of feature name strings
-    best_params         JSONB,            -- XGBoost hyperparameters used
-    notes               TEXT,
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- ---------------------------------------------------------------------------
 -- Row Level Security — public SELECT only
 --
 -- The pipeline connects with the SERVICE-ROLE key, which bypasses RLS entirely
 -- (full read/write). These policies govern only the anon/public role used by the
--- website: read-only, with no write policy (so no anon writes). See also
--- migrations/001_game_time_and_rls.sql.
+-- website: read-only, with no write policy (so no anon writes).
 -- ---------------------------------------------------------------------------
 ALTER TABLE predictions    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE shap_values    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE running_record ENABLE ROW LEVEL SECURITY;
-ALTER TABLE model_metadata ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS "public read predictions"    ON predictions;
 DROP POLICY IF EXISTS "public read shap_values"    ON shap_values;
 DROP POLICY IF EXISTS "public read running_record" ON running_record;
-DROP POLICY IF EXISTS "public read model_metadata" ON model_metadata;
 
 CREATE POLICY "public read predictions"    ON predictions    FOR SELECT USING (true);
 CREATE POLICY "public read shap_values"    ON shap_values    FOR SELECT USING (true);
 CREATE POLICY "public read running_record" ON running_record FOR SELECT USING (true);
-CREATE POLICY "public read model_metadata" ON model_metadata FOR SELECT USING (true);

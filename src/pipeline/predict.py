@@ -1,44 +1,61 @@
 """
-Predict the outcome of an NBA game.
+Predict pro LoL series from the lolesports schedule.
 
-Two modes
----------
-1. Historical game (already in our data):
-     python src/pipeline/predict.py --game-id 0042500237
+Per match (team1 = teams[0], team2 = teams[1]):
+  p1     = P(team1 wins a game on blue)            features: team1 blue, team2 red
+  p2     = 1 - P(team2 wins a game on blue)        features: team2 blue, team1 red
+  p_game = (p1 + p2) / 2                           side-neutral (sides aren't known pre-match)
+  series = features.series_win_prob(p_game, best_of)
+  SHAP   = top 10 of the team1-blue orientation (positive pushes toward team1)
 
-2. Any matchup by team abbreviation + date:
-     python src/pipeline/predict.py --home NYK --away OKC --date 2026-06-05
+Live context: the lolesports league slug maps to the OE league code (OE_LEAGUE);
+playoffs = 1 for a domestic match whose blockName names a knockout stage
+(Playoffs, Finals, Knockouts, Play-Ins / Play In Knockouts; OE flags those as
+playoffs), always 0 for internationals (OE never flags them).
 
-Output
-------
-  - Predicted winner + home win probability
-  - Top 10 most influential features (SHAP values)
-  - Actual result (if the game is in our data)
+Modes
+-----
+  python src/pipeline/predict.py --match-id 115660588583171786
+  python src/pipeline/predict.py --team1 "Gen.G Esports" --team2 T1 --bo 5 [--league lck]
+  (daily pipeline) predict_upcoming(): every unstarted PREDICT_LEAGUES match in the
+  next window_hours -> Supabase predictions + shap_values. A row that already has
+  actual_winner is never touched; unstarted rows are refreshed.
 """
 
 import argparse
 import logging
+import os
 import pickle
+import re
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import xgboost as xgb
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+from pipeline import elo, lolesports
+from pipeline.daily_state import load_team_games
+from pipeline.features import build_feature_matrix, series_win_prob
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-RAW_DIR       = Path(__file__).parent.parent / "data" / "raw"
-PROCESSED_DIR = Path(__file__).parent.parent / "data" / "processed"
-MODELS_DIR    = Path(__file__).parent.parent / "models"
-MODEL_PATH    = MODELS_DIR / "xgb_model.pkl"
+MODEL_PATH = Path(__file__).parent.parent / "models" / "xgb_model.pkl"
+
+PREDICT_LEAGUES = ["lck", "lpl", "lec", "lcs", "cblol-brazil", "lcp", "worlds", "msi", "first_stand"]
+OE_LEAGUE = {"lck": "LCK", "lpl": "LPL", "lec": "LEC", "lcs": "LCS", "cblol-brazil": "CBLOL",
+             "lcp": "LCP", "worlds": "WLDs", "msi": "MSI", "first_stand": "FST"}
+_PLAYOFF_BLOCK = re.compile(r"playoff|final|knockout|play.?in", re.IGNORECASE)
+SHAP_TOP_N = 10
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Model
 # ---------------------------------------------------------------------------
 
 def _load_model() -> dict:
@@ -48,155 +65,53 @@ def _load_model() -> dict:
         return pickle.load(f)
 
 
-def _load_game_logs() -> pd.DataFrame:
-    frames = [pd.read_csv(f) for f in sorted(RAW_DIR.glob("game_log_*.csv"))]
-    df = pd.concat(frames, ignore_index=True)
-    df["GAME_ID"]   = df["GAME_ID"].astype(str).str.zfill(10)
-    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
-    return df.drop_duplicates(subset=["GAME_ID", "TEAM_ID"])
+def _matrix(bundle: dict, feats: list[dict]) -> np.ndarray:
+    return np.array([[f.get(n, np.nan) for n in bundle["feature_names"]] for f in feats],
+                    dtype=np.float32)
 
 
-def _load_player_stats(season: str) -> pd.DataFrame:
-    path = RAW_DIR / f"player_season_stats_{season}.csv"
-    return pd.read_csv(path) if path.exists() else pd.DataFrame()
+def _predict_proba(bundle: dict, feats: list[dict]) -> np.ndarray:
+    """Platt-calibrated P(blue wins) per feature dict."""
+    raw = bundle["base_model"].predict_proba(_matrix(bundle, feats))[:, 1].reshape(-1, 1)
+    return bundle["platt"].predict_proba(raw)[:, 1]
 
 
-def _date_to_season(date: pd.Timestamp) -> str:
-    y = date.year
-    return f"{y}-{str(y+1)[2:]}" if date.month >= 10 else f"{y-1}-{str(y)[2:]}"
-
-
-def _team_id(abbrev: str, game_log_df: pd.DataFrame) -> str:
-    rows = game_log_df[game_log_df["TEAM_ABBREVIATION"].str.upper() == abbrev.upper()]
-    if rows.empty:
-        raise ValueError(f"Unknown team abbreviation: {abbrev}")
-    return str(rows["TEAM_ID"].iloc[0])
-
-
-def _team_abbrev(team_id: str, game_log_df: pd.DataFrame) -> str:
-    rows = game_log_df[game_log_df["TEAM_ID"] == int(team_id)]
-    return str(rows["TEAM_ABBREVIATION"].iloc[0]) if not rows.empty else team_id
-
-
-def _predict_proba(model_bundle: dict, feature_dict: dict) -> float:
-    """Run the Platt-calibrated model and return P(home win)."""
-    feature_names = model_bundle["feature_names"]
-    base_model    = model_bundle["base_model"]
-    platt         = model_bundle["platt"]
-
-    row = np.array([[feature_dict.get(f, 0.0) for f in feature_names]], dtype=np.float32)
-    raw = base_model.predict_proba(row)[:, 1].reshape(-1, 1)
-    return float(platt.predict_proba(raw)[0, 1])
-
-
-def _shap_top_features(model_bundle: dict, feature_dict: dict, n: int = 10) -> list[tuple]:
-    """Return top-n (feature_name, shap_value) sorted by abs impact."""
-    try:
-        import shap
-    except ImportError:
-        return []
-
-    feature_names = model_bundle["feature_names"]
-    base_model    = model_bundle["base_model"]
-    row = np.array([[feature_dict.get(f, 0.0) for f in feature_names]], dtype=np.float32)
-
-    explainer = shap.TreeExplainer(base_model)
-    shap_vals = explainer.shap_values(row)[0]
-
-    pairs = sorted(zip(feature_names, shap_vals), key=lambda x: abs(x[1]), reverse=True)
-    return pairs[:n]
+def _shap_top(bundle: dict, feats: dict, n: int = SHAP_TOP_N) -> list[tuple[str, float]]:
+    """Top-n (feature, SHAP value) by |impact| on the base model's log-odds (XGBoost TreeSHAP)."""
+    contribs = bundle["base_model"].get_booster().predict(
+        xgb.DMatrix(_matrix(bundle, [feats])), pred_contribs=True)[0, :-1]   # last = bias
+    pairs = sorted(zip(bundle["feature_names"], contribs), key=lambda x: abs(x[1]), reverse=True)
+    return [(f, float(v)) for f, v in pairs[:n]]
 
 
 # ---------------------------------------------------------------------------
 # Core prediction
 # ---------------------------------------------------------------------------
 
-def predict_matchup(
-    home_team_id: str,
-    away_team_id: str,
-    game_date: str,
-    game_log_df: pd.DataFrame,
-    player_stats_df: pd.DataFrame,
-    season: str,
-    game_id: str = "0000000000",
-) -> dict:
-    """
-    Build features and predict a single game.
+def match_context(league_slug: str, block_name: str | None) -> dict:
+    """{"league": OE code, "playoffs": 0/1} for build_feature_matrix (see module docstring)."""
+    league = OE_LEAGUE[league_slug]
+    playoffs = league not in elo.INTERNATIONAL and bool(_PLAYOFF_BLOCK.search(block_name or ""))
+    return {"league": league, "playoffs": int(playoffs)}
 
-    Args:
-        home_team_id:    NBA team ID for the home team
-        away_team_id:    NBA team ID for the away team
-        game_date:       ISO date string "YYYY-MM-DD"
-        game_log_df:     Combined game log (all seasons)
-        player_stats_df: Season player stats for the relevant season
-        season:          Season string e.g. "2023-24"
-        game_id:         10-digit game ID if known (fake ID for hypothetical games)
 
-    Returns:
-        dict with prediction results and feature values
-    """
-    from pipeline.features import build_feature_matrix
-
-    feature_dict = build_feature_matrix(
-        game_id         = game_id,
-        home_team_id    = home_team_id,
-        away_team_id    = away_team_id,
-        game_date       = game_date,
-        season          = season,
-        game_log_df     = game_log_df,
-        player_stats_df = player_stats_df,
-        use_current_elo = (game_id == "0000000000"),
-    )
-
-    model_bundle   = _load_model()
-    home_win_prob  = _predict_proba(model_bundle, feature_dict)
-    shap_features  = _shap_top_features(model_bundle, feature_dict)
-
-    home_abbrev = _team_abbrev(home_team_id, game_log_df)
-    away_abbrev = _team_abbrev(away_team_id, game_log_df)
-
-    predicted_winner = home_abbrev if home_win_prob >= 0.5 else away_abbrev
-    winner_prob      = home_win_prob if home_win_prob >= 0.5 else (1 - home_win_prob)
-
-    return {
-        "game_id":        game_id,
-        "game_date":      game_date,
-        "home_team":      home_abbrev,
-        "away_team":      away_abbrev,
-        "home_win_prob":  round(home_win_prob, 4),
-        "away_win_prob":  round(1 - home_win_prob, 4),
-        "predicted_winner": predicted_winner,
-        "confidence":     round(winner_prob, 4),
-        "shap_features":  shap_features,
-        "feature_dict":   feature_dict,
-    }
+def predict_match(team1_id: str, team2_id: str, best_of: int, day, context: dict,
+                  team_games: pd.DataFrame, bundle: dict) -> dict:
+    """Side-neutral game probability, series probability and SHAP top list for team1."""
+    f1 = build_feature_matrix(team1_id, team2_id, day, context, team_games, True)
+    f2 = build_feature_matrix(team2_id, team1_id, day, context, team_games, True)
+    p1_blue, p2_blue = _predict_proba(bundle, [f1, f2])
+    p_game = float((p1_blue + 1.0 - p2_blue) / 2.0)
+    return {"game_prob": p_game, "series_prob": series_win_prob(p_game, best_of),
+            "shap": _shap_top(bundle, f1), "features": f1}
 
 
 # ---------------------------------------------------------------------------
-# Today's games (daily pipeline entry point)
+# Daily pipeline entry point
 # ---------------------------------------------------------------------------
-
-PREDICTION_COLS = [
-    "game_id", "game_date", "game_time_utc", "home_team", "away_team",
-    "home_team_id", "away_team_id", "predicted_winner", "predicted_team",
-    "home_win_prob", "away_win_prob", "confidence",
-]
-
-
-def _today_et() -> str:
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-
-
-def _prev_season(season: str) -> str:
-    start = int(season[:4])
-    return f"{start - 1}-{str(start)[2:]}"
-
 
 def _get_supabase():
     from supabase import create_client
-    import os
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_KEY")
     if not url or not key:
@@ -204,235 +119,183 @@ def _get_supabase():
     return create_client(url, key)
 
 
-def predict_todays_games(
-    date: str | None = None,
-    dry_run: bool = False,
-    schedule: dict | None = None,
-    db=None,
-) -> list[dict]:
+def _row(event: dict, start: datetime, pred: dict) -> dict:
+    t1, t2 = event["match"]["teams"]
+    p, s = round(pred["game_prob"], 4), round(pred["series_prob"], 4)
+    pick = t1 if s >= 0.5 else t2
+    return {
+        "match_id":          event["match"]["id"],
+        "league_slug":       event["league"]["slug"],
+        "league_name":       event["league"]["name"],
+        "block_name":        event.get("blockName"),
+        "start_time_utc":    start.isoformat(),
+        "match_date":        start.date().isoformat(),
+        "best_of":           event["match"]["strategy"]["count"],
+        "team1_code":        t1["code"], "team1_name": t1["name"], "team1_image": t1.get("image"),
+        "team2_code":        t2["code"], "team2_name": t2["name"], "team2_image": t2.get("image"),
+        "team1_game_prob":   p,
+        "team1_series_prob": s,
+        "team2_series_prob": round(1.0 - s, 4),
+        "predicted_team":    pick["code"],
+        "confidence":        max(s, round(1.0 - s, 4)),
+    }
+
+
+def predict_upcoming(window_hours: float = 36, date: str | None = None, dry_run: bool = False,
+                     db=None) -> list[dict]:
     """
-    Predict every stateful game (regular season / playoffs / play-in / Cup final)
-    on an ET date and upsert the results to Supabase.
+    Predict every unstarted PREDICT_LEAGUES match starting within window_hours of now
+    (or of 00:00 UTC on `date`) and upsert it on match_id with its SHAP rows.
 
-    Preseason and all-star games are skipped. Live features are used (team lineups
-    from the ELO state, no future box score). For each game the prediction is
-    upserted on game_id and its SHAP rows are replaced (delete-then-insert top 10).
-
-    Args:
-        date:     ET date 'YYYY-MM-DD' (defaults to today, Eastern time).
-        dry_run:  print instead of writing to Supabase.
-        schedule: pre-fetched CDN schedule dict (fetched from the CDN if None).
-        db:       Supabase client (created from env when None and not dry_run).
-
-    Returns the list of prediction rows (empty when there are no games).
+    Skipped: TBD teams and started matches (lolesports.upcoming_matches), teams that
+    don't resolve to an OE teamid (logged), best_of outside {1, 3, 5}, and rows that
+    already have actual_winner. dry_run logs instead of writing (db is then optional).
+    A match that raises (malformed event, failed write) is logged and skipped; the
+    rest still run, then this raises once. Returns the prediction rows.
     """
-    from pipeline import nba_cdn
-    from pipeline.features import build_feature_matrix
-
-    et_date = date or _today_et()
-    # Only predict stateful games that have not tipped off yet (gameStatus 1 =
-    # scheduled). Predicting a live/final game would let a manual re-run rewrite a
-    # pick after the fact.
-    games = [g for g in nba_cdn.games_for_date(et_date, schedule=schedule)
-             if nba_cdn.is_stateful(g["game_id"]) and g["game_status"] == 1]
-
-    if not games:
-        logger.info("No unstarted games to predict on %s.", et_date)
+    start = (datetime.fromisoformat(date).replace(tzinfo=timezone.utc) if date
+             else datetime.now(timezone.utc))
+    events = lolesports.upcoming_matches(PREDICT_LEAGUES, start, start + timedelta(hours=window_hours))
+    if not events:
+        logger.info("No unstarted matches in the next %sh.", window_hours)
         return []
+    logger.info("Predicting %d match(es) starting %s .. +%sh", len(events),
+                start.isoformat(timespec="minutes"), window_hours)
 
-    logger.info("Predicting %d game(s) on %s ...", len(games), et_date)
-
-    game_log_df     = _load_game_logs()
-    season          = _date_to_season(pd.to_datetime(et_date))
-    player_stats_df = _load_player_stats(season)
-    prev_stats_df   = _load_player_stats(_prev_season(season))
-    model_bundle    = _load_model()
-
+    team_games = load_team_games()
+    bundle = _load_model()
     if not dry_run and db is None:
         db = _get_supabase()
 
-    results: list[dict] = []
-    for g in games:
-        # Never overwrite a prediction that has already been graded (guards manual
-        # re-runs after a game has been played).
-        if not dry_run:
-            graded = (db.table("predictions").select("actual_winner")
-                        .eq("game_id", g["game_id"]).execute().data)
-            if graded and graded[0].get("actual_winner") is not None:
-                logger.info("  %s already graded — leaving prediction untouched", g["game_id"])
-                continue
+    results, failed = [], []
+    for e in events:
+        try:
+            row = _predict_event(e, start, team_games, bundle, db, dry_run)
+        except Exception as exc:        # one bad match must not block the others
+            match_id = (e.get("match") or {}).get("id")
+            logger.warning("  %s: prediction failed: %s", match_id, exc)
+            failed.append(str(match_id))
+            continue
+        if row is not None:
+            results.append(row)
 
-        home_id = str(g["home_team_id"])
-        away_id = str(g["away_team_id"])
-        home_ab = g["home_tricode"]
-        away_ab = g["away_tricode"]
-
-        feats = build_feature_matrix(
-            game_id         = g["game_id"],
-            home_team_id    = home_id,
-            away_team_id    = away_id,
-            game_date       = et_date,
-            season          = season,
-            game_log_df     = game_log_df,
-            player_stats_df = player_stats_df,
-            use_current_elo = True,
-            prev_player_stats_df = prev_stats_df,
-        )
-
-        home_win_prob = round(_predict_proba(model_bundle, feats), 4)
-        away_win_prob = round(1 - home_win_prob, 4)
-        is_home_pick  = home_win_prob >= 0.5
-
-        row = {
-            "game_id":          g["game_id"],
-            "game_date":        et_date,
-            "game_time_utc":    g["game_time_utc"],
-            "home_team":        home_ab,
-            "away_team":        away_ab,
-            "home_team_id":     home_id,
-            "away_team_id":     away_id,
-            "predicted_winner": "home" if is_home_pick else "away",
-            "predicted_team":   home_ab if is_home_pick else away_ab,
-            "home_win_prob":    home_win_prob,
-            "away_win_prob":    away_win_prob,
-            "confidence":       home_win_prob if is_home_pick else away_win_prob,
-        }
-        shap_pairs = _shap_top_features(model_bundle, feats, n=10)
-
-        if dry_run:
-            logger.info(
-                "  %s @ %s  →  %s (%.1f%%)  | elo_general_diff=%.1f",
-                away_ab, home_ab, row["predicted_team"], row["confidence"] * 100,
-                feats.get("elo_general_diff", 0.0),
-            )
-        else:
-            resp = db.table("predictions").upsert(row, on_conflict="game_id").execute()
-            pred_id = resp.data[0]["id"]
-            db.table("shap_values").delete().eq("prediction_id", pred_id).execute()
-            if shap_pairs:
-                db.table("shap_values").insert([
-                    {
-                        "prediction_id": pred_id,
-                        "feature_name":  feat,
-                        "shap_value":    round(float(val), 6),
-                        "feature_value": round(float(feats.get(feat, 0.0)), 4),
-                    }
-                    for feat, val in shap_pairs
-                ]).execute()
-
-        results.append(row)
-
-    logger.info("Predicted %d game(s) on %s.", len(results), et_date)
+    logger.info("Predicted %d of %d match(es)%s.", len(results), len(events),
+                " [dry-run]" if dry_run else "")
+    if failed:
+        raise RuntimeError(f"prediction failed for {len(failed)} match(es): {', '.join(failed)}")
     return results
 
 
-# ---------------------------------------------------------------------------
-# Pretty print
-# ---------------------------------------------------------------------------
+def _predict_event(e: dict, start: datetime, team_games: pd.DataFrame, bundle: dict, db,
+                   dry_run: bool) -> dict | None:
+    """Predict + upsert one schedule event; None if it is skipped (logged)."""
+    m = e["match"]
+    t1, t2 = m["teams"]
+    ids = [lolesports.resolve_team(t["name"], t["code"], team_games, as_of=start) for t in (t1, t2)]
+    if None in ids:
+        logger.warning("  %s %s vs %s: unmapped team, skipped", m["id"], t1["code"], t2["code"])
+        return None
+    if m["strategy"]["count"] not in (1, 3, 5):
+        logger.warning("  %s: best of %s not supported, skipped", m["id"], m["strategy"]["count"])
+        return None
+    if db is not None:
+        existing = (db.table("predictions").select("actual_winner")
+                    .eq("match_id", m["id"]).execute().data)
+        if existing and existing[0].get("actual_winner") is not None:
+            logger.info("  %s already resolved - leaving it untouched", m["id"])
+            return None
 
-def _print_prediction(result: dict, actual_winner: str | None = None) -> None:
-    home = result["home_team"]
-    away = result["away_team"]
-    pred = result["predicted_winner"]
-    conf = result["confidence"] * 100
+    when = lolesports._start(e)
+    pred = predict_match(ids[0], ids[1], m["strategy"]["count"], when,
+                         match_context(e["league"]["slug"], e.get("blockName")), team_games, bundle)
+    row = _row(e, when, pred)
+    logger.info("  %s %-9s %-14s Bo%d  %s vs %s  game %.3f  series %.3f -> %s (%.1f%%)",
+                when.strftime("%m-%d %H:%M"), row["league_slug"], row["block_name"] or "",
+                row["best_of"], row["team1_code"], row["team2_code"], row["team1_game_prob"],
+                row["team1_series_prob"], row["predicted_team"], row["confidence"] * 100)
 
-    print()
-    print("=" * 52)
-    print(f"  {away}  @  {home}    ({result['game_date']})")
-    print("=" * 52)
-    print(f"  Home win prob : {result['home_win_prob']*100:.1f}%")
-    print(f"  Away win prob : {result['away_win_prob']*100:.1f}%")
-    print(f"  Prediction    : {pred} wins  ({conf:.1f}% confident)")
-
-    if actual_winner is not None:
-        correct = "✓ CORRECT" if actual_winner == pred else "✗ WRONG"
-        print(f"  Actual winner : {actual_winner}   {correct}")
-
-    if result["shap_features"]:
-        print()
-        print("  Top factors (SHAP):")
-        for feat, val in result["shap_features"]:
-            direction = "→ home" if val > 0 else "→ away"
-            print(f"    {feat:<38} {val:+.4f}  {direction}")
-
-    print("=" * 52)
-    print()
+    if not dry_run:
+        pred_id = db.table("predictions").upsert(row, on_conflict="match_id").execute().data[0]["id"]
+        db.table("shap_values").delete().eq("prediction_id", pred_id).execute()
+        db.table("shap_values").insert([
+            {"prediction_id": pred_id, "feature_name": f, "shap_value": round(v, 6),
+             "feature_value": None if np.isnan(pred["features"].get(f, np.nan))
+             else round(pred["features"][f], 4)}
+            for f, v in pred["shap"]]).execute()
+    return row
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description="Predict NBA game outcome")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--game-id",  help="10-digit game ID (historical game in our data)")
-    group.add_argument("--home",     help="Home team abbreviation (e.g. NYK)")
+def _print_prediction(title: str, t1: str, t2: str, best_of: int, pred: dict) -> None:
+    s = pred["series_prob"]
+    print()
+    print("=" * 60)
+    print(f"  {title}")
+    print(f"  {t1}  vs  {t2}   (Bo{best_of})")
+    print("=" * 60)
+    print(f"  {t1} game win prob (side-neutral): {pred['game_prob'] * 100:.1f}%")
+    print(f"  {t1} series win prob             : {s * 100:.1f}%")
+    print(f"  Prediction: {t1 if s >= 0.5 else t2} wins ({max(s, 1 - s) * 100:.1f}%)")
+    print()
+    print(f"  Top factors (SHAP, {t1} on blue):")
+    for f, v in pred["shap"]:
+        print(f"    {f:<38} {v:+.4f}  -> {t1 if v > 0 else t2}")
+    print("=" * 60)
 
-    parser.add_argument("--away",  help="Away team abbreviation (required with --home)")
-    parser.add_argument("--date",  help="Game date YYYY-MM-DD (required with --home)")
+
+def main():
+    parser = argparse.ArgumentParser(description="Predict a pro LoL series")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--match-id", help="lolesports match id")
+    group.add_argument("--team1", help="Team name as on lolesports/OE, e.g. 'Gen.G Esports'")
+    parser.add_argument("--team2", help="Second team name (with --team1)")
+    parser.add_argument("--bo", type=int, choices=(1, 3, 5), help="Best of (with --team1)")
+    parser.add_argument("--league", choices=sorted(OE_LEAGUE),
+                        help="League slug (with --team1; default: team1's latest OE league)")
+    parser.add_argument("--date", help="UTC date YYYY-MM-DD (default: today)")
+    parser.add_argument("--window", type=float, default=36, help="Hours ahead (default mode)")
+    parser.add_argument("--dry-run", action="store_true", help="Default mode: print, don't write")
     args = parser.parse_args()
 
-    logger.info("Loading game logs...")
-    game_log_df = _load_game_logs()
+    if not args.match_id and not args.team1:
+        predict_upcoming(window_hours=args.window, date=args.date, dry_run=args.dry_run)
+        return
 
-    # ── Mode 1: predict by game ID ───────────────────────────────────────────
-    if args.game_id:
-        game_id = str(args.game_id).zfill(10)
-        row = game_log_df[game_log_df["GAME_ID"] == game_id]
-        if row.empty:
-            print(f"Game ID {game_id} not found in game logs.")
-            sys.exit(1)
-
-        home_row  = row[row["MATCHUP"].str.contains(" vs. ")]
-        away_row  = row[row["MATCHUP"].str.contains(" @ ")]
-        if home_row.empty:
-            print(f"Cannot determine home team for {game_id}.")
-            sys.exit(1)
-
-        home_team_id = str(home_row["TEAM_ID"].iloc[0])
-        away_team_id = str(away_row["TEAM_ID"].iloc[0]) if not away_row.empty else ""
-        game_date    = str(home_row["GAME_DATE"].iloc[0].date())
-        game_date_ts = pd.to_datetime(game_date)
-        season       = _date_to_season(game_date_ts)
-
-        # Actual result from the log
-        actual_home_wl = home_row["WL"].iloc[0]
-        home_abbrev    = _team_abbrev(home_team_id, game_log_df)
-        away_abbrev    = _team_abbrev(away_team_id, game_log_df) if away_team_id else "?"
-        actual_winner  = home_abbrev if actual_home_wl == "W" else away_abbrev
-
-    # ── Mode 2: predict by team abbreviations ────────────────────────────────
+    team_games = load_team_games()
+    day = pd.Timestamp(args.date or datetime.now(timezone.utc).date())
+    if args.match_id:
+        # getEventDetails has no blockName: playoffs = 0.
+        e = lolesports.get_event_details(args.match_id)
+        if e is None:
+            sys.exit(f"Unknown lolesports match id: {args.match_id}")
+        if e["league"]["slug"] not in OE_LEAGUE:
+            sys.exit(f"League {e['league']['slug']!r} is not predicted (known: {', '.join(sorted(OE_LEAGUE))})")
+        t1, t2 = e["match"]["teams"]
+        names, best_of = (t1["name"], t2["name"]), e["match"]["strategy"]["count"]
+        ids = [lolesports.resolve_team(t["name"], t["code"], team_games) for t in (t1, t2)]
+        context, title = match_context(e["league"]["slug"], None), f"{e['league']['name']} {args.match_id}"
     else:
-        if not args.away or not args.date:
-            parser.error("--away and --date are required when using --home")
-
-        home_team_id = _team_id(args.home, game_log_df)
-        away_team_id = _team_id(args.away, game_log_df)
-        game_date    = args.date
-        game_date_ts = pd.to_datetime(game_date)
-        season       = _date_to_season(game_date_ts)
-        game_id      = "0000000000"
-        actual_winner = None
-
-        logger.info("Predicting %s @ %s on %s (season %s)...",
-                    args.away, args.home, game_date, season)
-
-    player_stats_df = _load_player_stats(season)
-    if player_stats_df.empty:
-        logger.warning("No player stats found for season %s — availability features will be empty", season)
-
-    result = predict_matchup(
-        home_team_id    = home_team_id,
-        away_team_id    = away_team_id,
-        game_date       = game_date,
-        game_log_df     = game_log_df,
-        player_stats_df = player_stats_df,
-        season          = season,
-        game_id         = game_id,
-    )
-
-    _print_prediction(result, actual_winner=actual_winner)
+        if not args.team2 or not args.bo:
+            parser.error("--team2 and --bo are required with --team1")
+        names, best_of = (args.team1, args.team2), args.bo
+        ids = [lolesports.resolve_team(n, n, team_games) for n in names]
+    if None in ids:
+        sys.exit(f"Unmapped team: {names[ids.index(None)]} (add it to team_aliases.csv)")
+    if not args.match_id:
+        if args.league:
+            league = OE_LEAGUE[args.league]
+        else:       # team1's latest domestic league
+            rows = team_games[(team_games["teamid"] == ids[0])
+                              & ~team_games["league"].isin(elo.INTERNATIONAL)]
+            if rows.empty:
+                sys.exit(f"No domestic games for {names[0]}: pass --league")
+            league = rows.loc[rows["date"].idxmax(), "league"]
+        context, title = {"league": league, "playoffs": 0}, f"ad hoc, league {league}"
+    pred = predict_match(ids[0], ids[1], best_of, day, context, team_games, _load_model())
+    _print_prediction(f"{title}  {day.date()}", names[0], names[1], best_of, pred)
 
 
 if __name__ == "__main__":

@@ -38,7 +38,8 @@ MAX_SCHEDULE_PAGES = 10
 
 ALIASES_PATH = Path(__file__).parent / "team_aliases.csv"
 RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
-_SUFFIXES = ("esports", "gaming", "team", "club", "academy")
+# Not "academy": academy rosters are separate teams ("T1 Esports Academy" != "T1").
+_SUFFIXES = ("esports", "gaming", "team", "club")
 
 
 def _get(endpoint: str, **params) -> dict:
