@@ -99,6 +99,20 @@ def test_training_equals_live(base, norms):
     assert not np.isnan(train["blue_league_mean_outcome_elo"]) and train["blue_roster_churn"] == 5
 
 
+def test_training_equals_live_across_new_year(base, norms):
+    # LCK-JAN is the lineups' first game of 2027, where elo applies the off-season pull.
+    # Training's as-of value (LCK-JAN's pre-game snapshot) must equal live's (state built
+    # up to the day before), i.e. the pull must not leak into the snapshot.
+    games = pd.concat([base[base["gameid"] == LCK]] + [
+        base[base["gameid"] == LCK].assign(gameid=gid, date=pd.Timestamp(d))
+        for gid, d in (("LCK-DEC", "2026-12-30"), ("LCK-JAN", "2027-01-05"))], ignore_index=True)
+    train = _feats(games, norms, "LCK-JAN")
+    before = games[games["date"] < pd.Timestamp("2027-01-05")]
+    live = _feats(games, norms, "LCK-JAN", live=True, elo_games=before, tg=oe.team_rows(before))
+    _assert_same(train, live)
+    assert train["diff_outcome_elo"] != 0
+
+
 def test_player_form_window(base, norms, monkeypatch):
     games = _games(base)
     # Blue (HANJIN) starters have 2 games before DAY: the window reaches their first (init) game.

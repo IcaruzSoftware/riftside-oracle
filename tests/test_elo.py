@@ -121,7 +121,10 @@ def test_partial_game_skips_laning_only(base, norms):
 
 
 def test_outcome_elo_zero_sum_between_sides(base, norms):
+    # Precondition: zero-sum only holds when both sides share k. Every fixture player
+    # is within their first NEW_GAMES games, so all get NEW_K_MULT (mixed case below).
     h = _post(elo.build_elo(force=True, games=base, norms=norms))
+    assert h.groupby("player_id").size().max() <= elo.NEW_GAMES
     h["d"] = h["post_outcome_elo"] - h["pre_outcome_elo"]
     for _, g in h.groupby("game_id"):
         blue, red = g[g["side"] == "Blue"], g[g["side"] == "Red"]
@@ -134,18 +137,87 @@ def test_outcome_elo_zero_sum_between_sides(base, norms):
 
 def test_outcome_elo_exact_delta(base, norms):
     h = _post(elo.build_elo(force=True, games=base, norms=norms))
-    res = oe.player_rows(base).set_index(["gameid", "playerid"])["result"]
-    h["result"] = h.set_index(["game_id", "player_id"]).index.map(res).astype(float)
+    rows = oe.player_rows(base).set_index(["gameid", "playerid"])
+    key = h.set_index(["game_id", "player_id"]).index
+    h["result"] = key.map(rows["result"]).astype(float)
+    h["gd15"], h["len"] = key.map(rows["golddiffat15"]), key.map(rows["gamelength"])
+    h["n_before"] = h.groupby("player_id").cumcount()
     uneven = 0
     for _, g in h.groupby("game_id"):
-        r_blue = g.loc[g["side"] == "Blue", "pre_outcome_elo"].mean()
-        r_red = g.loc[g["side"] == "Red", "pre_outcome_elo"].mean()
+        blue = g["side"] == "Blue"
+        r_blue = g.loc[blue, "pre_outcome_elo"].mean()
+        r_red = g.loc[~blue, "pre_outcome_elo"].mean()
         e_blue = 1 / (1 + 10 ** ((r_red - r_blue) / 400))
-        e = np.where(g["side"] == "Blue", e_blue, 1 - e_blue)
+        e = np.where(blue, e_blue, 1 - e_blue)
+        gd = g.loc[blue, "gd15"].sum() if g["gd15"].notna().all() else np.nan
+        k = (elo.K * elo.mov_mult(gd, g["len"].iloc[0])
+             * np.where(g["n_before"] < elo.NEW_GAMES, elo.NEW_K_MULT, 1.0))
         np.testing.assert_allclose(g["post_outcome_elo"] - g["pre_outcome_elo"],
-                                   elo.K * (g["result"] - e), atol=1e-9)
+                                   k * (g["result"] - e), atol=1e-9)
         uneven += abs(e_blue - 0.5) > 0.1
     assert uneven >= 1   # the MSI game (LCK side vs 1350 newcomers) is far from 50/50
+
+
+def test_outcome_elo_new_players_move_further(base, norms, monkeypatch):
+    # NEW_GAMES=1: at MSI the HLE side (1 earlier LCK game) has plain k, the BLG side
+    # (first game) NEW_K_MULT * k, so the game is not zero-sum.
+    monkeypatch.setattr(elo, "NEW_GAMES", 1)
+    h = _post(elo.build_elo(force=True, games=base, norms=norms))
+    g = h[h["game_id"] == MSI].assign(d=lambda x: x["post_outcome_elo"] - x["pre_outcome_elo"])
+    seen = g["player_id"].isin(h.loc[h["game_id"] == LCK, "player_id"])
+    assert seen.sum() == 5
+    assert g.loc[~seen, "d"].mean() == pytest.approx(-elo.NEW_K_MULT * g.loc[seen, "d"].mean())
+
+
+def test_mov_mult():
+    assert elo.mov_mult(elo.MOV_GD_REF, 1000) == pytest.approx(1.0)   # gd15 wins over length
+    assert elo.mov_mult(8000, 0) > elo.mov_mult(-3000, 0) > elo.mov_mult(0, 0) > 0
+    assert elo.mov_mult(np.nan, elo.MOV_LEN_REF) == pytest.approx(1.0)
+    assert elo.mov_mult(np.nan, 1200) > 1 > elo.mov_mult(np.nan, 2400)    # short win = dominant
+    assert elo.mov_mult(np.nan, np.nan) == elo.mov_mult(np.nan, 0) == 1.0                  # no usable margin
+
+
+def _new_year_games(base):
+    """LCK game (Jan 2026), the same lineups on 2026-12-30 and on 2027-01-05."""
+    return pd.concat([base[base["gameid"] == LCK],
+                      _copy_game(base, LCK, "LCK-DEC", "2026-12-30"),
+                      _copy_game(base, LCK, "LCK-JAN", "2027-01-05")], ignore_index=True)
+
+
+def test_new_year_regression_toward_league_mean(base, norms):
+    # 10 LCK players, LCK mean stays 1600 (zero-sum, equal k). At LCK-JAN each rating is
+    # first pulled REGRESS toward 1600, then updated; the pre-game snapshot is unpulled.
+    games = _new_year_games(base)
+    elo.build_elo(force=True, games=games[games["gameid"] != "LCK-JAN"], norms=norms)
+    end_2026 = _current()["outcome_elo"]
+    mean = end_2026.mean()
+    assert mean == pytest.approx(elo.LEAGUE_PRIOR["LCK"]) and end_2026.std() > 0
+
+    h = elo.build_elo(force=True, games=games, norms=norms)
+    jan = h[h["game_id"] == "LCK-JAN"].set_index("player_id")
+    np.testing.assert_allclose(jan["pre_outcome_elo"], end_2026.reindex(jan.index))
+
+    pulled = end_2026.reindex(jan.index) + elo.REGRESS * (mean - end_2026.reindex(jan.index))
+    blue = (jan["side"] == "Blue").to_numpy()
+    e_blue = 1 / (1 + 10 ** ((pulled[~blue].mean() - pulled[blue].mean()) / 400))
+    rows = oe.player_rows(games[games["gameid"] == "LCK-JAN"]).set_index("playerid").reindex(jan.index)
+    k = elo.K * elo.mov_mult(rows.loc[blue, "golddiffat15"].sum(), rows["gamelength"].iloc[0]) * elo.NEW_K_MULT
+    expect = pulled + k * (rows["result"] - np.where(blue, e_blue, 1 - e_blue))
+    np.testing.assert_allclose(_current()["outcome_elo"].reindex(jan.index), expect)
+
+
+def test_new_year_update_elo_matches_full_rebuild(base, norms, monkeypatch):
+    games = _new_year_games(base)
+    elo.build_elo(force=True, games=games, norms=norms)
+    full_cur, full_rec = _current(), pd.read_parquet(elo.RECENT_PATH)
+    elo.build_elo(force=True, games=games[games["gameid"] != "LCK-JAN"], norms=norms)
+    elo.update_elo(games[games["gameid"] == "LCK-JAN"])
+    pd.testing.assert_frame_equal(full_cur, _current(), check_like=True, atol=1e-9)
+    pd.testing.assert_frame_equal(full_rec, pd.read_parquet(elo.RECENT_PATH), check_like=True, atol=1e-9)
+    # ... and the pull really happened: without it the state differs.
+    monkeypatch.setattr(elo, "REGRESS", 0.0)
+    elo.build_elo(force=True, games=games, norms=norms)
+    assert (_current()["outcome_elo"] - full_cur["outcome_elo"]).abs().min() > 1e-6
 
 
 def test_new_player_league_prior_and_league_mean(base, norms):

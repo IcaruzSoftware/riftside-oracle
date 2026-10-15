@@ -4,8 +4,9 @@ Train XGBoost classifier on the feature matrix to predict blue-side game wins.
 Approach
 --------
   - Chronological train / calibration / test split, 70/15/15 (test = most recent games)
-  - Optuna hyperparameter search using TimeSeriesSplit CV on train + calibration
-    (85%; its last fold overlaps the calibration slice — the test slice is untouched)
+  - Optuna hyperparameter search minimising log loss in TimeSeriesSplit CV on the
+    train slice only (70%), so the calibration slice stays clean for Platt and for
+    model selection
   - Final model retrained on full training set with best params
   - Platt calibration applied so output probabilities are well-calibrated
   - Metrics, feature importance, and model saved to disk
@@ -109,7 +110,7 @@ def load_training_data() -> tuple[np.ndarray, np.ndarray, list[str], pd.DataFram
 # ---------------------------------------------------------------------------
 
 def _make_objective(X_train: np.ndarray, y_train: np.ndarray) -> callable:
-    """Return an Optuna objective that runs TimeSeriesSplit CV and returns mean AUC."""
+    """Return an Optuna objective that runs TimeSeriesSplit CV and returns mean log loss."""
 
     def objective(trial: optuna.Trial) -> float:
         params = {
@@ -130,8 +131,8 @@ def _make_objective(X_train: np.ndarray, y_train: np.ndarray) -> callable:
             "verbosity":         0,
         }
 
-        tscv      = TimeSeriesSplit(n_splits=CV_FOLDS)
-        auc_scores = []
+        tscv   = TimeSeriesSplit(n_splits=CV_FOLDS)
+        losses = []
 
         for train_idx, val_idx in tscv.split(X_train):
             model = xgb.XGBClassifier(**params)
@@ -141,9 +142,9 @@ def _make_objective(X_train: np.ndarray, y_train: np.ndarray) -> callable:
                 verbose=False,
             )
             probs = model.predict_proba(X_train[val_idx])[:, 1]
-            auc_scores.append(roc_auc_score(y_train[val_idx], probs))
+            losses.append(log_loss(y_train[val_idx], probs))
 
-        return float(np.mean(auc_scores))
+        return float(np.mean(losses))
 
     return objective
 
@@ -175,7 +176,7 @@ def train(n_trials: int = OPTUNA_N_TRIALS, force: bool = False) -> object:
     Full training pipeline:
       1. Load feature matrix
       2. Chronological train/test split
-      3. Optuna search on train + calibration (TimeSeriesSplit CV)
+      3. Optuna search on train (TimeSeriesSplit CV, log loss)
       4. Retrain best params on full training set
       5. Platt calibration on a held-out calibration slice
       6. Evaluate calibrated model on held-out test set
@@ -202,8 +203,7 @@ def train(n_trials: int = OPTUNA_N_TRIALS, force: bool = False) -> object:
     test_split  = int(n * (1 - TEST_FRACTION))
     cal_split   = int(n * (1 - TEST_FRACTION * 2))   # half of 30% → 15% cal
 
-    X_trainval, X_test = X[:test_split], X[test_split:]
-    y_trainval, y_test = y[:test_split], y[test_split:]
+    X_test, y_test = X[test_split:], y[test_split:]
     X_train,    X_cal  = X[:cal_split],  X[cal_split:test_split]
     y_train,    y_cal  = y[:cal_split],  y[cal_split:test_split]
 
@@ -214,16 +214,16 @@ def train(n_trials: int = OPTUNA_N_TRIALS, force: bool = False) -> object:
 
     # ── Optuna hyperparameter search ─────────────────────────────────────────
     logger.info("Optuna search: %d trials × %d CV folds...", n_trials, CV_FOLDS)
-    study = optuna.create_study(direction="maximize")
+    study = optuna.create_study(direction="minimize")
     study.optimize(
-        _make_objective(X_trainval, y_trainval),
+        _make_objective(X_train, y_train),
         n_trials=n_trials,
         show_progress_bar=True,
     )
 
     best_params = {**study.best_params, "objective": "binary:logistic",
                    "tree_method": "hist", "random_state": 42, "n_jobs": N_JOBS, "verbosity": 0}
-    logger.info("Best CV AUC: %.4f", study.best_value)
+    logger.info("Best CV log loss: %.4f", study.best_value)
     logger.info("Best params: %s", best_params)
 
     # ── Train base model on X_train ──────────────────────────────────────────
@@ -296,7 +296,7 @@ def train(n_trials: int = OPTUNA_N_TRIALS, force: bool = False) -> object:
         "auc_roc":               auc_roc,
         "brier_score":           brier,
         "log_loss":              logloss,
-        "optuna_best_cv_auc":    study.best_value,
+        "optuna_best_cv_logloss": study.best_value,
         "train_samples":         len(X_train),
         "calibration_samples":   len(X_cal),
         "test_samples":          len(X_test),

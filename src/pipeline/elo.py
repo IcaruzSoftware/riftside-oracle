@@ -18,7 +18,16 @@ Performance: 5 skill ELOs + general ELO (sum of the skills). Per game, per skill
 
 Outcome: classic Elo on the game result. Team rating R = mean outcome_elo of the
 side's rated starters, E = 1 / (1 + 10^((R_opp - R) / 400)), each starter
-+= K * (result - E). Skipped if a side has no rated starters. A new player starts
++= k * (result - E) with k = K * mov_mult (margin of victory: gold diff @15, else
+game length) * NEW_K_MULT for a player's first NEW_GAMES games. Skipped if a side
+has no rated starters. Because k is per player, a game between new and established
+players is NOT zero-sum (the new side moves NEW_K_MULT times as far); it is zero-sum
+when both sides have the same k. At a player's first game of a new calendar year,
+if that game is in a domestic league with >= MIN_LEAGUE_PLAYERS players, outcome_elo
+first moves REGRESS of the way to that league's mean (off-season regression). If the
+year's first game is international or in a small league, there is no pull that year. The pull is applied
+inside that game's update, AFTER its pre-game snapshot, so the snapshot equals the
+previous post-game state (training == live, no look-ahead). A new player starts
 at the current mean outcome_elo of players whose last game was in the same OE
 league (if >= MIN_LEAGUE_PLAYERS such players), else LEAGUE_PRIOR / DEFAULT_PRIOR.
 This is what carries strength across regions (internationals, transfers).
@@ -112,7 +121,33 @@ LEAGUE_PRIOR = {
     "LTA": 1500.0,
     "LCP": 1450.0, "PCS": 1450.0, "LMS": 1450.0, "CBLOL": 1450.0, "LTA S": 1450.0,
 }
-INTERNATIONAL = {"WLDs", "MSI", "FST", "EWC", "MSC"}   # cross-region signal; K unchanged in v1
+INTERNATIONAL = {"WLDs", "MSI", "FST", "EWC", "MSC"}   # cross-region signal; K unchanged
+
+# Deviates from spec §5.2 ("zero-sum", "no seasonal regression in v1") on purpose:
+# Outcome Elo refinements, chosen on the 2021-07..2025-05 walk-forward validation
+# (3 windows before the test slice; MAJOR series log loss -0.0043, 95% CI
+# [-0.0064, -0.0022], game log loss -0.0026 vs plain K=24; the new-year pull alone is
+# -0.0028 [-0.0045, -0.0010] of it). Other K values and an international K
+# multiplier did not help.
+REGRESS = 0.2           # a player's first game of a new calendar year: pull toward the league mean
+NEW_K_MULT = 2.0        # K multiplier for a player's first NEW_GAMES games (fast placement)
+NEW_GAMES = 20
+MOV_GD_REF = 2289.0     # mean |team gold diff @15| (2014-2026 OE games with @15 stats)
+MOV_LEN_REF = 1890.0    # median gamelength in seconds (fallback: partial games lack @15 stats)
+
+
+def mov_mult(gd15: float, gamelength: float) -> float:
+    """
+    Margin-of-victory K multiplier: sqrt of |team gold diff @15| relative to its mean
+    (+500 so even games still move), or sqrt(median / gamelength) when @15 is missing,
+    or 1.0 when neither is usable (keeps a bad row from writing NaN/inf into the state).
+    """
+    if not np.isnan(gd15):
+        return float(np.sqrt((abs(gd15) + 500.0) / (MOV_GD_REF + 500.0)))
+    if not gamelength > 0:          # also catches NaN
+        return 1.0
+    return float(np.sqrt(MOV_LEN_REF / gamelength))
+
 
 HISTORY_COLS = (
     ["game_id", "game_date", "player_id", "player_name", "team_id", "position", "league",
@@ -243,6 +278,8 @@ def _replay(st: dict, players: pd.DataFrame, norms: dict) -> pd.DataFrame:
     dates  = p["date"].tolist()
     res    = p["result"].to_numpy(dtype=float, na_value=np.nan)
     blue   = (p["side"] == "Blue").to_numpy()
+    gd15   = p["golddiffat15"].to_numpy(dtype=float, na_value=np.nan)
+    glen   = p["gamelength"].to_numpy(dtype=float, na_value=np.nan)
 
     pre  = np.full((len(p), 1 + len(SKILLS)), np.nan)
     keep = np.zeros(len(p), dtype=bool)
@@ -266,9 +303,23 @@ def _replay(st: dict, players: pd.DataFrame, norms: dict) -> pd.DataFrame:
                     outcome[q] = init
                     skills[q] = np.full(len(SKILLS), INITIAL_ELO)
 
-        o = np.array([outcome[q] for q in ps])
+        # Snapshot BEFORE the new-year pull: the pre-game snapshot must equal the
+        # previous post-game state (= what live mode reads from player_elo_current),
+        # and the pull uses this game's league mean, which a December as-of lookup
+        # must not see.
         S = np.array([skills[q] for q in ps])
-        pre[a:b, 0], pre[a:b, 1:], keep[a:b] = o, S, True
+        pre[a:b, 0], pre[a:b, 1:], keep[a:b] = [outcome[q] for q in ps], S, True
+
+        if lg not in INTERNATIONAL and lcnt[lg] >= MIN_LEAGUE_PLAYERS:
+            m = lsum[lg] / lcnt[lg]
+            for q in ps:
+                old = meta.get(q)
+                if old is not None and date.year > old["last_game_date"].year:
+                    d = REGRESS * (m - outcome[q])
+                    lsum[old["league"]] += d
+                    outcome[q] += d
+
+        o = np.array([outcome[q] for q in ps])      # pulled: used for E and the update
 
         S = S + np.column_stack([compute_deltas(scores[a:b, k]) for k in range(len(SKILLS))])
 
@@ -277,7 +328,11 @@ def _replay(st: dict, players: pd.DataFrame, norms: dict) -> pd.DataFrame:
         # Needs both sides rated and consistent results (3 OE games have both sides at 0).
         if bl.any() and not bl.all() and r[bl][0] + r[~bl][0] == 1:
             e_blue = 1.0 / (1.0 + 10.0 ** ((o[~bl].mean() - o[bl].mean()) / 400.0))
-            o_new = o + K * (r - np.where(bl, e_blue, 1.0 - e_blue))
+            gd = gd15[a:b]
+            k = K * mov_mult(gd[bl].sum() if not np.isnan(gd).any() else np.nan, glen[a])
+            k = k * np.array([NEW_K_MULT if meta.get(q, {}).get("games_played", 0) < NEW_GAMES else 1.0
+                              for q in ps])
+            o_new = o + k * (r - np.where(bl, e_blue, 1.0 - e_blue))
 
         for i, q in enumerate(ps):
             old = meta.get(q)
