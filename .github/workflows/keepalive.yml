@@ -1,0 +1,42 @@
+name: Keepalive
+
+on:
+  schedule:
+    - cron: "17 6 * * *"   # ~06:17 UTC daily, off the top of the hour
+  workflow_dispatch:
+
+permissions:
+  contents: read   # default; nothing here needs to write repo contents
+  actions: write    # required for `gh workflow enable` below
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Supabase free-tier projects auto-pause after ~7 days with no activity.
+      # A cheap authenticated read keeps the project awake, and -f makes curl
+      # exit non-zero on an HTTP error so a paused/unreachable project fails the job.
+      - name: Ping Supabase to prevent auto-pause
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          curl -fsS "$SUPABASE_URL/rest/v1/running_record?select=id&limit=1" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY"
+
+      # GitHub auto-disables scheduled workflows in public repos after 60 days
+      # without repository activity (this already happened to both daily_*.yml
+      # workflows). Re-enabling them on every keepalive run keeps the schedules
+      # alive indefinitely. `if: always()` so this still runs even if the
+      # Supabase ping above failed, keeping the daily workflows on while still
+      # surfacing the failed ping.
+      - name: Keep scheduled workflows enabled
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow enable daily_evaluate.yml --repo "${{ github.repository }}"
+          gh workflow enable daily_predict.yml --repo "${{ github.repository }}"
+          gh workflow enable keepalive.yml --repo "${{ github.repository }}"

@@ -1,0 +1,27 @@
+name: Check NBA Proxies
+
+# Manual-only: verify the configured NBA_PROXIES can reach cdn.nba.com.
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check CDN access through each proxy
+        env:
+          NBA_PROXIES: ${{ secrets.NBA_PROXIES }}
+        run: python src/pipeline/nba_cdn.py --check

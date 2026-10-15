@@ -1,0 +1,38 @@
+name: Daily Predictions
+
+on:
+  # Runs after Daily Evaluate finishes (any conclusion — a failed evaluate still
+  # predicts, on possibly day-old state) so it always sees the latest committed
+  # state; not a cron, so no scheduler delay.
+  workflow_run:
+    workflows: ["Daily Evaluate"]
+    types: [completed]
+  workflow_dispatch:        # allow manual trigger from GitHub UI
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+        with:
+          # workflow_run otherwise may check out the SHA from before evaluate's
+          # state commit.
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch today's schedule + predict
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          NBA_PROXIES:  ${{ secrets.NBA_PROXIES }}
+        run: python src/scripts/daily_run.py --predict
