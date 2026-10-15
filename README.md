@@ -1,4 +1,8 @@
-# Courtside Oracle
+# Riftside Oracle
+
+> **Fork in progress:** this is a fork of courtside-oracle being translated to League of Legends.
+> [RIFTSIDE_HANDOVER.md](RIFTSIDE_HANDOVER.md) is the spec and overrides the rest of this file where they conflict;
+> the sections below still describe the NBA original until Phase 6.
 
 An NBA game-outcome predictor: a custom per-player ELO system feeds an
 XGBoost classifier, predictions run daily via GitHub Actions, and results are

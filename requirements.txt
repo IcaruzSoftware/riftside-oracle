@@ -3,7 +3,6 @@
 # The scientific stack is pinned so the committed model (src/models/xgb_model.pkl,
 # saved with scikit-learn 1.8.0) unpickles and predicts cleanly with no
 # InconsistentVersionWarning. Do not bump scikit-learn without re-training.
-nba_api>=1.4.0
 tqdm>=4.66.0
 numpy==2.1.3
 pandas==2.2.3
@@ -13,4 +12,5 @@ xgboost==3.2.0
 shap>=0.44.0
 optuna>=3.5.0
 supabase>=2.4.0
+requests>=2.31.0
 matplotlib>=3.8.0

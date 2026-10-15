@@ -1,16 +1,12 @@
-"""Shared test fixtures: import path, a fake Supabase client, and a tiny live-state
-builder used by the prediction/evaluation tests."""
+"""Shared test fixtures: import path and a fake Supabase client."""
 
-import json
 import sys
 from pathlib import Path
 
-import pandas as pd
 import pytest
 
 ROOT = Path(__file__).parent.parent
 SRC = ROOT / "src"
-FIXTURES = Path(__file__).parent / "fixtures"
 sys.path.insert(0, str(SRC))
 
 
@@ -146,83 +142,3 @@ class FakeSupabase:
 def fake_supabase():
     return FakeSupabase
 
-
-@pytest.fixture(autouse=True)
-def _reset_nba_cdn():
-    """Clear cached CDN session/proxy state so NBA_PROXIES changes take effect per test."""
-    from pipeline import nba_cdn
-    nba_cdn.reset_session()
-    yield
-    nba_cdn.reset_session()
-
-
-# ---------------------------------------------------------------------------
-# Fixtures: real CDN box score + tiny live state built from it
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def finals_game():
-    return json.loads((FIXTURES / "boxscore_0042500405.json").read_text(encoding="utf-8"))["game"]
-
-
-def make_schedule(et_date: str, game: dict, status: int = 1) -> dict:
-    """A scheduleLeagueV2-shaped dict with one game on et_date (default status 1 =
-    scheduled, i.e. predictable)."""
-    home, away = game["homeTeam"], game["awayTeam"]
-    y, m, d = et_date[:4], et_date[5:7], et_date[8:10]
-    return {"leagueSchedule": {"gameDates": [{
-        "gameDate": f"{m}/{d}/{y} 00:00:00",
-        "games": [{
-            "gameId":          game["gameId"],
-            "gameDateTimeUTC": game.get("gameTimeUTC"),
-            "gameStatus":      status,
-            "homeTeam": {"teamId": home["teamId"], "teamTricode": home["teamTricode"], "score": home.get("score")},
-            "awayTeam": {"teamId": away["teamId"], "teamTricode": away["teamTricode"], "score": away.get("score")},
-        }],
-    }]}}
-
-
-@pytest.fixture
-def tiny_state(tmp_path, monkeypatch, finals_game):
-    """Build a minimal committed live state (ELO + game logs + player stats) from the
-    finals fixture in a temp dir, and repoint every module's data dirs at it."""
-    import pipeline.elo as elo
-    import pipeline.features as feat
-    import pipeline.predict as pred
-    import pipeline.daily_state as ds
-
-    raw = tmp_path / "raw"; raw.mkdir()
-    proc = tmp_path / "processed"; proc.mkdir()
-
-    monkeypatch.setattr(elo, "PROCESSED_DIR", proc)
-    monkeypatch.setattr(elo, "HISTORY_PATH", proc / "player_elo.parquet")
-    monkeypatch.setattr(elo, "CURRENT_PATH", proc / "player_elo_current.parquet")
-    monkeypatch.setattr(elo, "RECENT_PATH", proc / "player_elo_recent.parquet")
-    monkeypatch.setattr(feat, "PROCESSED_DIR", proc)
-    monkeypatch.setattr(feat, "RAW_DIR", raw)
-    monkeypatch.setattr(pred, "PROCESSED_DIR", proc)
-    monkeypatch.setattr(pred, "RAW_DIR", raw)
-    monkeypatch.setattr(ds, "RAW_DIR", raw)
-    for attr in ["_elo_current", "_elo_recent", "_elo_recent_by_player",
-                 "_elo_history", "_elo_by_game", "_elo_by_player"]:
-        monkeypatch.setattr(feat, attr, None)
-
-    gid, date = "0042500405", "2026-06-13"
-    frame = elo.load_cdn_game_players(finals_game)
-    game_index = pd.DataFrame({"GAME_ID": [gid], "GAME_DATE": [pd.Timestamp(date)]})
-    elo.build_elo(force=True, loader=lambda g: frame.copy(), game_index=game_index)
-
-    # Minimal game logs (both teams) from the same box score.
-    rows = ds._game_log_rows(finals_game, gid, date)
-    pd.DataFrame(rows).to_csv(raw / "game_log_playoffs_2025-26.csv", index=False)
-
-    # Minimal player season stats (PPG weights) for the players in the game.
-    contribs = ds._player_contribs(finals_game)
-    stats = pd.DataFrame(
-        [{"PLAYER_ID": int(pid), "PLAYER_NAME": name, "TEAM_ID": tid, "GP": 1, "PTS": pts}
-         for pid, tid, pts, name in contribs]
-    )
-    stats.to_csv(raw / "player_season_stats_2025-26.csv", index=False)
-
-    return {"raw": raw, "proc": proc, "date": date, "game_id": gid,
-            "schedule": make_schedule(date, finals_game)}

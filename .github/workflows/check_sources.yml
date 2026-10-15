@@ -1,6 +1,6 @@
-name: Check NBA Proxies
+name: Check Data Sources
 
-# Manual-only: verify the configured NBA_PROXIES can reach cdn.nba.com.
+# Manual-only: verify Oracle's Elixir and the lolesports API are reachable from a runner.
 on:
   workflow_dispatch:
 
@@ -21,7 +21,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Check CDN access through each proxy
-        env:
-          NBA_PROXIES: ${{ secrets.NBA_PROXIES }}
-        run: python src/pipeline/nba_cdn.py --check
+      - name: Check Oracle's Elixir
+        run: python src/pipeline/oe.py --check
+
+      - name: Check lolesports API
+        if: success() || failure()
+        run: python src/pipeline/lolesports.py --check

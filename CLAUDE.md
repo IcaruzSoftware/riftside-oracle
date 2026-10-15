@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+> **Fork in progress:** this is a fork of courtside-oracle being translated to League of Legends.
+> [RIFTSIDE_HANDOVER.md](RIFTSIDE_HANDOVER.md) is the spec and overrides the rest of this file where they conflict;
+> the sections below still describe the NBA original until Phase 6.
+
 Entry point for an AI session working in this repo. Read this first; it links
 to `docs/` for depth instead of duplicating it. Human-facing overview:
 [README.md](README.md).
