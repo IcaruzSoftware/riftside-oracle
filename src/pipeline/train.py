@@ -1,13 +1,17 @@
 """
-Train XGBoost classifier on the feature matrix to predict home team wins.
+Train XGBoost classifier on the feature matrix to predict blue-side game wins.
 
 Approach
 --------
-  - Chronological train/test split (no shuffle — test = most recent games)
-  - Optuna hyperparameter search using TimeSeriesSplit CV on training portion
+  - Chronological train / calibration / test split, 70/15/15 (test = most recent games)
+  - Optuna hyperparameter search using TimeSeriesSplit CV on train + calibration
+    (85%; its last fold overlaps the calibration slice — the test slice is untouched)
   - Final model retrained on full training set with best params
   - Platt calibration applied so output probabilities are well-calibrated
   - Metrics, feature importance, and model saved to disk
+  - Test-slice baselines: (a) always blue, (b) higher team outcome ELO; everything
+    also on the MAJOR-league slice, and a GATE line: PASS only if the calibrated
+    model beats baseline (b) on both log loss and accuracy there
 
 Outputs
 -------
@@ -25,6 +29,7 @@ Run
 import argparse
 import json
 import logging
+import os
 import pickle
 import sys
 from pathlib import Path
@@ -55,22 +60,29 @@ FEATURE_IMPORTANCE_PATH = PROCESSED_DIR / "feature_importance.csv"
 OPTUNA_N_TRIALS = 50
 TEST_FRACTION   = 0.15   # hold out most recent 15% as test set
 CV_FOLDS        = 5
+# ponytail: half the logical CPUs; all SMT threads made fits ~6x slower on the dev box
+N_JOBS          = max(1, (os.cpu_count() or 2) // 2)
 
-META_COLS = {"game_id", "game_date", "season", "home_team_id", "away_team_id", "home_win"}
+META_COLS = {"game_id", "game_date", "league", "blue_team_id", "red_team_id", "blue_win"}
+LABEL     = "blue_win"
+# OE codes of the leagues the site predicts (incl. their 2025 names) + internationals.
+MAJOR = {"LCK", "LPL", "LEC", "LCS", "CBLOL", "LCP", "LTA N", "LTA S", "LTA",
+         "WLDs", "MSI", "FST"}
 
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_training_data() -> tuple[np.ndarray, np.ndarray, list[str]]:
+def load_training_data() -> tuple[np.ndarray, np.ndarray, list[str], pd.DataFrame]:
     """
     Load feature_matrix.parquet, sort chronologically, return arrays.
 
     Returns:
         X:             float array (n_samples, n_features)
-        y:             int array   (n_samples,)  1=home win
+        y:             int array   (n_samples,)  1=blue win
         feature_names: list of column names matching X columns
+        df:            the sorted frame (meta columns for the test-slice reports)
     """
     path = PROCESSED_DIR / "feature_matrix.parquet"
     if not path.exists():
@@ -79,17 +91,17 @@ def load_training_data() -> tuple[np.ndarray, np.ndarray, list[str]]:
         )
 
     df = pd.read_parquet(path)
-    df = df.sort_values("game_date").reset_index(drop=True)
+    df = df.sort_values(["game_date", "game_id"], kind="stable").reset_index(drop=True)
 
     feature_cols = [c for c in df.columns if c not in META_COLS]
     X = df[feature_cols].values.astype(np.float32)
-    y = df["home_win"].values.astype(np.int32)
+    y = df[LABEL].values.astype(np.int32)
 
     logger.info(
-        "Loaded %d games | %d features | home win rate %.1f%%",
+        "Loaded %d games | %d features | blue win rate %.1f%%",
         len(df), len(feature_cols), y.mean() * 100,
     )
-    return X, y, feature_cols
+    return X, y, feature_cols, df
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +124,9 @@ def _make_objective(X_train: np.ndarray, y_train: np.ndarray) -> callable:
             "reg_lambda":        trial.suggest_float("reg_lambda",        1e-4, 10.0, log=True),
             "objective":         "binary:logistic",
             "eval_metric":       "logloss",
+            "tree_method":       "hist",
             "random_state":      42,
-            "n_jobs":            -1,
+            "n_jobs":            N_JOBS,
             "verbosity":         0,
         }
 
@@ -136,6 +149,24 @@ def _make_objective(X_train: np.ndarray, y_train: np.ndarray) -> callable:
 
 
 # ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+def _metrics(y: np.ndarray, p: np.ndarray) -> dict:
+    """accuracy (pick blue if p >= 0.5) / log loss / Brier / AUC of probabilities p."""
+    return {
+        "accuracy":    float(((p >= 0.5) == y).mean()),
+        "log_loss":    float(log_loss(y, p, labels=[0, 1])),
+        "brier_score": float(brier_score_loss(y, p)),
+        "auc_roc":     float(roc_auc_score(y, p)) if len(set(y)) == 2 else float("nan"),
+    }
+
+
+def _report(y: np.ndarray, probs: dict[str, np.ndarray]) -> dict:
+    return {"rows": int(len(y)), **{name: _metrics(y, p) for name, p in probs.items()}}
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -144,7 +175,7 @@ def train(n_trials: int = OPTUNA_N_TRIALS, force: bool = False) -> object:
     Full training pipeline:
       1. Load feature matrix
       2. Chronological train/test split
-      3. Optuna search on training portion (TimeSeriesSplit CV)
+      3. Optuna search on train + calibration (TimeSeriesSplit CV)
       4. Retrain best params on full training set
       5. Platt calibration on a held-out calibration slice
       6. Evaluate calibrated model on held-out test set
@@ -162,7 +193,7 @@ def train(n_trials: int = OPTUNA_N_TRIALS, force: bool = False) -> object:
         with open(MODEL_PATH, "rb") as f:
             return pickle.load(f)
 
-    X, y, feature_names = load_training_data()
+    X, y, feature_names, df = load_training_data()
     n = len(X)
 
     # ── Chronological splits ─────────────────────────────────────────────────
@@ -191,7 +222,7 @@ def train(n_trials: int = OPTUNA_N_TRIALS, force: bool = False) -> object:
     )
 
     best_params = {**study.best_params, "objective": "binary:logistic",
-                   "random_state": 42, "n_jobs": -1, "verbosity": 0}
+                   "tree_method": "hist", "random_state": 42, "n_jobs": N_JOBS, "verbosity": 0}
     logger.info("Best CV AUC: %.4f", study.best_value)
     logger.info("Best params: %s", best_params)
 
@@ -219,6 +250,25 @@ def train(n_trials: int = OPTUNA_N_TRIALS, force: bool = False) -> object:
     auc_roc     = float(roc_auc_score(y_test, test_probs))
     brier       = float(brier_score_loss(y_test, test_probs))
     logloss     = float(log_loss(y_test, test_probs))
+
+    # ── Baselines + MAJOR slice ──────────────────────────────────────────────
+    # (a) always blue: p = train-slice blue rate (> 0.5, so every pick is blue).
+    # (b) higher team outcome ELO: p = 1 / (1 + 10^(-diff/400)); a NaN diff -> 0.5.
+    test_df   = df.iloc[test_split:]
+    blue_rate = float(y_train.mean())
+    elo_diff  = test_df["diff_outcome_elo"].fillna(0.0).to_numpy()
+    probs = {
+        "model":                test_probs,
+        "baseline_always_blue": np.full(len(y_test), blue_rate),
+        "baseline_outcome_elo": 1.0 / (1.0 + 10.0 ** (-elo_diff / 400.0)),
+    }
+    major = test_df["league"].isin(MAJOR).to_numpy()
+    report = {
+        "all":   _report(y_test, probs),
+        "major": _report(y_test[major], {k: v[major] for k, v in probs.items()}),
+    }
+    m, b = report["major"]["model"], report["major"]["baseline_outcome_elo"]
+    gate = "PASS" if m["log_loss"] < b["log_loss"] and m["accuracy"] > b["accuracy"] else "FAIL"
 
     # Calibration curve (10 bins)
     frac_pos, mean_pred = calibration_curve(y_test, test_probs, n_bins=10)
@@ -251,6 +301,11 @@ def train(n_trials: int = OPTUNA_N_TRIALS, force: bool = False) -> object:
         "calibration_samples":   len(X_cal),
         "test_samples":          len(X_test),
         "n_features":            len(feature_names),
+        "train_blue_rate":       blue_rate,
+        "test_from":             str(test_df["game_date"].min().date()),
+        "test_to":               str(test_df["game_date"].max().date()),
+        "test_report":           report,
+        "gate":                  gate,
         "best_params":           best_params,
         "calibration_curve": {
             "fraction_of_positives": frac_pos.tolist(),
@@ -275,7 +330,7 @@ def train(n_trials: int = OPTUNA_N_TRIALS, force: bool = False) -> object:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train NBA game outcome XGBoost model")
+    parser = argparse.ArgumentParser(description="Train the LoL blue-side win XGBoost model")
     parser.add_argument("--trials", type=int, default=OPTUNA_N_TRIALS,
                         help=f"Number of Optuna trials (default: {OPTUNA_N_TRIALS})")
     parser.add_argument("--force", action="store_true",
@@ -293,5 +348,14 @@ if __name__ == "__main__":
         print(f"  AUC-ROC   : {m['auc_roc']:.4f}")
         print(f"  Brier     : {m['brier_score']:.4f}  (lower = better, 0.25 = coin flip)")
         print(f"  Log Loss  : {m['log_loss']:.4f}")
+        print(f"\nTest slice {m['test_from']} .. {m['test_to']}")
+        for name, rep in m["test_report"].items():
+            print(f"\n  {name} ({rep['rows']:,} games)   accuracy  log_loss  brier   auc")
+            for k in ("model", "baseline_always_blue", "baseline_outcome_elo"):
+                r = rep[k]
+                print(f"  {k:<22} {r['accuracy']:.4f}    {r['log_loss']:.4f}   "
+                      f"{r['brier_score']:.4f}  {r['auc_roc']:.4f}")
+        print(f"\nGATE: {m['gate']} - calibrated model vs baseline_outcome_elo on the MAJOR "
+              "slice (needs lower log loss AND higher accuracy)")
         print(f"\nModel → {MODEL_PATH}")
         print(f"Metrics → {METRICS_PATH}")

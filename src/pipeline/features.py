@@ -1,899 +1,435 @@
 """
-Feature engineering for NBA game outcome prediction.
+Feature engineering for pro LoL: P(blue side wins one game).
 
-Entry point: build_feature_matrix(...) → dict[str, float]
-Returns a flat dict of named features ready for XGBoost.
+Entry point: build_feature_matrix(...) -> dict[str, float]
+Returns a flat dict of named features ready for XGBoost. Per-team features come
+as blue_*, red_* and diff_* (blue - red).
 
-Feature groups
---------------
-  elo          — usage-weighted team ELO per skill + differentials
-  rolling      — last-5 / last-10 team stats (pts, opp_pts, net, win%)
-  rest         — days rest, back-to-back, games in last 7 days
-  splits       — home vs away win% / scoring for each team this season
-  h2h          — head-to-head record between the two teams this season
-  availability — star player out, missing PPG weight
-  efficiency   — rolling offensive vs defensive net rating proxy
-  form         — ELO trajectory over last 10 games (rising / falling)
-  streak       — current win/loss streak + last-5 win%
+Feature groups (one get_*_features() each, each in its own try/except)
+-----------------------------------------------------------------------
+  elo      starter means of outcome/general/5 skill ELOs + per-role lane diffs
+  rolling  last-5 / last-10 games: win%, gd@15, game length, kills/deaths per min,
+           first blood/dragon/herald/tower/baron rates, dragons per game
+  side     win% on blue / on red in the last 365 days, plus the side-matching one
+  rest     days since the last game, games in the last 7 days
+  h2h      head-to-head games / blue-team wins / win% in the last 365 days
+  roster   starters shared by the team's two latest lineups, rookies (< 20 games)
+  form     mean starter change in general/outcome ELO over their last 10 games
+  streak   signed current win/loss streak (last-5 win% is rolling's win_pct_last5)
+  context  is_international, playoffs, league tier, each team's home-league mean
+           outcome ELO
 
-Pre-loading pattern (for the matrix builder script)
-----------------------------------------------------
-Load game_log_df and player_stats_df once across all seasons, then pass
-them into build_feature_matrix() per game. The ELO dataframes are cached
-at module level (loaded on first access).
+Point-in-time rule (day level)
+------------------------------
+A game on calendar day d sees only team_games rows with day < d and player ELO
+"as of the start of day d":
+  training  pre-game snapshot of the player's first game on/after d
+            (player_elo.parquet), else the player's current value
+  live      the player's row in player_elo_current.parquet
+Live predictions are made before a series with data up to the previous day, so in
+training game 2 of a series must not see game 1 either.
+
+Training vs live (the one difference: rosters)
+----------------------------------------------
+  starters  training: the 5 who played (team_games row of game_id); live: the
+            team's latest lineup before d (or the caller's starters)
+  missing   training: an empty slot / unknown id is left out of team means (its
+            lane diffs are NaN); live: §5.2 init value (outcome = mean of current
+            players last seen in the team's home league if >= 10, else the league
+            prior; skills 1000 each)
+  form      training: history snapshots; live: player_elo_recent.parquet
+
+team_games_df is the oe.TEAM_GAMES_COLS frame (training: all OE years in memory,
+live: the committed team_games_*.csv). It is indexed once per DataFrame object, so
+pass the same object for every game and don't mutate it in between.
 """
 
-import json
 import logging
-from pathlib import Path
+import math
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
+from pipeline import elo, oe
+
 logger = logging.getLogger(__name__)
 
-RAW_DIR       = Path(__file__).parent.parent / "data" / "raw"
-PROCESSED_DIR = Path(__file__).parent.parent / "data" / "processed"
+VALS = ["outcome", "general"] + elo.SKILLS      # column order of every ELO vector
+_SNAP_COLS = [f"pre_{v}_elo" for v in VALS]
+_CUR_COLS = [f"{v}_elo" for v in VALS]
 
-ELO_SKILLS = [
-    "scoring", "playmaking", "defense",
-    "rebounding", "efficiency", "hustle", "three_point",
-]
-_ELO_INITIAL = 1000.0
+ROLL_WINDOWS = (5, 10)
+YEAR_DAYS = 365
+REST_WINDOW = 7
+FORM_N = 10
+ROOKIE_GAMES = 20
+STAT_NAMES = ["win_pct", "gd15", "gamelength", "kills_pm", "deaths_pm", "firstblood_rate",
+              "firstdragon_rate", "firstherald_rate", "firsttower_rate", "firstbaron_rate",
+              "dragons"]
+_NO_STARTERS = (None,) * len(oe.ROLES)
 
-# ---------------------------------------------------------------------------
-# ELO cache — loaded once, reused across all feature calls
-# ---------------------------------------------------------------------------
-
-_elo_history:   pd.DataFrame | None = None
-_elo_current:   pd.DataFrame | None = None
-_elo_recent:    pd.DataFrame | None = None
-_elo_by_game:   dict | None = None   # game_id  → sub-DataFrame (O(1) lookup)
-_elo_by_player: dict | None = None   # player_id → sorted sub-DataFrame (O(1) lookup)
-_elo_recent_by_player: dict | None = None   # live-mode form: player_id → recent snapshots
+# Lazy caches: ELO state per mode ("train"/"live") and the team_games index ("tg").
+# Paths are elo.HISTORY_PATH / CURRENT_PATH / RECENT_PATH, read at load time.
+_cache: dict = {}
 
 
-def _get_elo_history() -> pd.DataFrame:
-    global _elo_history
-    if _elo_history is None:
-        p = PROCESSED_DIR / "player_elo.parquet"
-        if not p.exists():
-            raise FileNotFoundError("player_elo.parquet not found — run elo.py first")
-        _elo_history = pd.read_parquet(p)
-        _elo_history["player_id"] = _elo_history["player_id"].astype(str)
-    return _elo_history
+def _days(dates) -> np.ndarray:
+    return pd.to_datetime(dates).to_numpy().astype("datetime64[D]").astype(np.int64)
 
 
-def _get_elo_current() -> pd.DataFrame:
-    global _elo_current
-    if _elo_current is None:
-        p = PROCESSED_DIR / "player_elo_current.parquet"
-        if not p.exists():
-            raise FileNotFoundError("player_elo_current.parquet not found — run elo.py first")
-        _elo_current = pd.read_parquet(p)
-        _elo_current["player_id"] = _elo_current["player_id"].astype(str)
-    return _elo_current
+def _day(date) -> int:
+    return int(np.datetime64(pd.Timestamp(date).date(), "D").astype(np.int64))
 
 
-def _get_elo_by_game() -> dict:
-    """Dict of game_id → ELO sub-DataFrame. Built once, O(1) per lookup."""
-    global _elo_by_game
-    if _elo_by_game is None:
-        df = _get_elo_history()
-        _elo_by_game = {gid: sub for gid, sub in df.groupby("game_id")}
-    return _elo_by_game
+def _nanmean(x: np.ndarray) -> np.ndarray:
+    """Column-wise NaN-skipping mean of a 2D array; all-NaN or empty column -> NaN."""
+    ok = ~np.isnan(x)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(ok, x, 0.0).sum(0) / ok.sum(0)
 
 
-def _get_elo_by_player() -> dict:
-    """Dict of player_id → ELO history sorted by date. Built once, O(1) per lookup."""
-    global _elo_by_player
-    if _elo_by_player is None:
-        df = _get_elo_history()
-        _elo_by_player = {
-            pid: sub.sort_values("game_date").reset_index(drop=True)
-            for pid, sub in df.groupby("player_id")
-        }
-    return _elo_by_player
-
-
-def _get_elo_recent() -> pd.DataFrame:
-    """Live-mode source for the form feature: last-N pre-game snapshots per player."""
-    global _elo_recent
-    if _elo_recent is None:
-        p = PROCESSED_DIR / "player_elo_recent.parquet"
-        if not p.exists():
-            raise FileNotFoundError("player_elo_recent.parquet not found — run elo.py first")
-        _elo_recent = pd.read_parquet(p)
-        _elo_recent["player_id"] = _elo_recent["player_id"].astype(str)
-    return _elo_recent
-
-
-def _get_elo_recent_by_player() -> dict:
-    """Dict of player_id → recent pre-game snapshots sorted by date (live form feature)."""
-    global _elo_recent_by_player
-    if _elo_recent_by_player is None:
-        df = _get_elo_recent()
-        _elo_recent_by_player = {
-            pid: sub.sort_values("game_date").reset_index(drop=True)
-            for pid, sub in df.groupby("player_id")
-        }
-    return _elo_recent_by_player
+def _mean(x: np.ndarray) -> float:
+    return float(x.mean()) if len(x) else np.nan
 
 
 # ---------------------------------------------------------------------------
-# Live-mode helpers (season derivation, PPG weights, roster from ELO state)
+# ELO state
 # ---------------------------------------------------------------------------
 
-def _season_of(date) -> str:
-    """NBA season string for a date (Oct–Sep season boundary), e.g. Mar 2024 → '2023-24'."""
-    ts = pd.to_datetime(date)
-    y = ts.year
-    return f"{y}-{str(y + 1)[2:]}" if ts.month >= 10 else f"{y - 1}-{str(y)[2:]}"
+def _by_player(df: pd.DataFrame) -> dict:
+    """player_id -> (day array, value matrix in VALS order), chronological per player."""
+    pid = df["player_id"].to_numpy()
+    order = np.argsort(pid, kind="stable")          # files are chronological: keep that order
+    pid, days, vals = pid[order], _days(df["game_date"])[order], df[_SNAP_COLS].to_numpy(float)[order]
+    starts = np.flatnonzero(np.r_[True, pid[1:] != pid[:-1]]) if len(pid) else np.array([], int)
+    ends = np.r_[starts[1:], len(pid)]
+    return {pid[a]: (days[a:b], vals[a:b]) for a, b in zip(starts, ends)}
 
 
-def _prev_season(season: str) -> str:
-    start = int(season[:4])
-    return f"{start - 1}-{str(start)[2:]}"
-
-
-def _build_ppg_lookup(*stats_frames) -> dict[str, float]:
-    """player_id → PPG. Later frames override earlier ones (pass previous season first)."""
-    ppg: dict[str, float] = {}
-    for df in stats_frames:
-        if df is not None and not df.empty and "PLAYER_ID" in df.columns:
-            for _, row in df.iterrows():
-                ppg[str(int(row["PLAYER_ID"]))] = max(float(row.get("PTS", 5.0)), 1.0)
-    return ppg
-
-
-def _live_team_lineup(current_elo: pd.DataFrame, team_id: str, season: str) -> pd.DataFrame:
+def _elo_state(live: bool) -> dict:
     """
-    Players making up a team's live lineup, taken from the ELO state.
-
-    A player belongs to the team when their latest appearance (the team_id stored
-    in the post-game state) is that team. Current-season appearances are preferred;
-    if the team has fewer than 8 of those (e.g. early in the season, before rosters
-    have played enough), we add previous-season appearances too. Players whose latest
-    game is older than the previous season (i.e. retired / long gone) are excluded.
+    cur:    player_id -> (post-game ELO vector, games_played) from the current file
+    snaps:  player_id -> pre-game snapshots (training: full history, live: recent tail)
+    league: OE league -> (outcome sum, player count) by last league (live init only)
     """
-    same_team = current_elo[
-        pd.to_numeric(current_elo["team_id"], errors="coerce") == int(team_id)
-    ]
-    if same_team.empty:
-        return same_team
-    seasons = same_team["last_game_date"].apply(_season_of)
-    in_season = same_team[seasons == season]
-    if len(in_season) >= 8:
-        return in_season
-    return same_team[seasons.isin({season, _prev_season(season)})]
+    key = "live" if live else "train"
+    if key not in _cache:
+        cur = pd.read_parquet(elo.CURRENT_PATH)
+        st = {"cur": dict(zip(cur["player_id"], zip(cur[_CUR_COLS].to_numpy(float),
+                                                     cur["games_played"].tolist()))),
+              "snaps": _by_player(pd.read_parquet(elo.RECENT_PATH if live else elo.HISTORY_PATH))}
+        agg = cur.groupby("league")["outcome_elo"].agg(["sum", "count"])
+        st["league"] = dict(zip(agg.index, zip(agg["sum"], agg["count"])))
+        _cache[key] = st
+    return _cache[key]
+
+
+def _player(g: "_Game", pid) -> tuple[np.ndarray | None, int]:
+    """(ELO vector as of the start of g.day, games played before it); (None, 0) if unknown."""
+    if g.live:
+        return g.st["cur"].get(pid, (None, 0))
+    s = g.st["snaps"].get(pid)
+    if s is None:
+        return None, 0
+    i = int(np.searchsorted(s[0], g.day))
+    return (s[1][i] if i < len(s[0]) else g.st["cur"][pid][0]), i
+
+
+def _init(g: "_Game", league) -> np.ndarray:
+    """Live §5.2 init vector for a player missing from the ELO state."""
+    s, c = g.st["league"].get(league, (0.0, 0))
+    o = s / c if c >= elo.MIN_LEAGUE_PLAYERS else elo.LEAGUE_PRIOR.get(league, elo.DEFAULT_PRIOR)
+    return np.array([o, elo.INITIAL_ELO * len(elo.SKILLS)] + [elo.INITIAL_ELO] * len(elo.SKILLS))
+
+
+def _lineup(g: "_Game", starters, team_id) -> np.ndarray:
+    """(5, len(VALS)) ELO matrix of a lineup in role order; missing -> NaN (training) / init (live)."""
+    rows = []
+    for pid in starters:
+        v = _player(g, pid)[0] if pid else None
+        if v is None:
+            v = _init(g, _home_league(g, team_id) or g.league) if g.live else np.full(len(VALS), np.nan)
+        rows.append(v)
+    return np.array(rows)
 
 
 # ---------------------------------------------------------------------------
-# Box score helpers
+# team_games index
 # ---------------------------------------------------------------------------
 
-def _load_inactive_ids(game_id: str, team_id: str) -> set[str]:
-    """Return personIds of inactive players for a team in a game."""
-    path = RAW_DIR / f"boxscore_summary_{game_id}.json"
-    if not path.exists():
-        return set()
-    try:
-        d = json.loads(path.read_text())
-        if d.get("_absent") or "InactivePlayers" not in d:
-            return set()
-        ds = d["InactivePlayers"]
-        df = pd.DataFrame(ds["data"], columns=ds["headers"])
-        team_rows = df[df["teamId"].astype(str) == str(team_id)]
-        return set(team_rows["personId"].astype(str))
-    except Exception:
-        return set()
+def _parse_starters(s) -> tuple:
+    return tuple(p if isinstance(p, str) and p else None for p in s) if s is not None else _NO_STARTERS
 
 
-def _load_team_player_ids(game_id: str, team_id: str) -> set[str]:
-    """Return personIds of all players who appeared for a team in a game."""
-    path = RAW_DIR / f"boxscore_traditional_{game_id}.json"
-    if not path.exists():
-        return set()
-    try:
-        d = json.loads(path.read_text())
-        if "PlayerStats" not in d:
-            return set()
-        ds = d["PlayerStats"]
-        df = pd.DataFrame(ds["data"], columns=ds["headers"])
-        team_rows = df[df["teamId"].astype(str) == str(team_id)]
-        return set(team_rows["personId"].astype(str))
-    except Exception:
-        return set()
-
-
-# ---------------------------------------------------------------------------
-# 1. ELO features
-# ---------------------------------------------------------------------------
-
-def _get_elo_features_live(
-    home_team_id: str,
-    away_team_id: str,
-    season: str,
-    player_stats_df: pd.DataFrame,
-    prev_player_stats_df: pd.DataFrame | None,
-) -> dict:
+def _team_index(tg: pd.DataFrame) -> dict:
     """
-    Live-prediction ELO features (no future box score exists yet).
-
-    Each team's lineup is read from the ELO state (players whose latest appearance
-    was for that team) instead of from the game's box score, and each team's
-    composite ELO is the PPG-weighted average of those players' post-game ELOs.
-    PPG weights come from the current season, falling back to the previous season
-    for players without a current-season line yet.
+    Built once per team_games DataFrame object:
+      teams:    teamid -> per-row arrays sorted by (date, gameid) (NaN teamids dropped)
+      games:    (gameid, side) -> starters tuple
+      leagues:  non-international league -> (day array, teamid array) of its team rows
+      lmean:    (league, day, live) -> league mean outcome ELO (filled lazily)
     """
-    current = _get_elo_current()
-    ppg_lookup = _build_ppg_lookup(prev_player_stats_df, player_stats_df)
-    all_skills = ELO_SKILLS + ["general"]
+    hit = _cache.get("tg")
+    if hit is not None and hit[0] is tg:
+        return hit[1]
+    t = tg.sort_values(["date", "gameid"], kind="stable").reset_index(drop=True)
+    starters = [_parse_starters(s.split("|") if isinstance(s, str) else None) for s in t["starters"]]
+    keys = list(zip(t["gameid"], t["side"]))
+    side_team = dict(zip(keys, t["teamid"]))
+    opp = np.array([side_team.get((gid, "Red" if side == "Blue" else "Blue")) for gid, side in keys],
+                   dtype=object)
+    minutes = t["gamelength"].astype(float) / 60.0
+    stats = np.column_stack([
+        t["result"].astype(float), t["golddiffat15"], minutes,
+        t["teamkills"] / minutes, t["teamdeaths"] / minutes,
+        t["firstblood"], t["firstdragon"], t["firstherald"], t["firsttower"], t["firstbaron"],
+        t["dragons"],
+    ]).astype(float)
+    day = _days(t["date"])
+    blue = (t["side"] == "Blue").to_numpy()
+    league = t["league"].to_numpy(dtype=object)
+    domestic = ~t["league"].isin(elo.INTERNATIONAL).to_numpy()
+    teamid = t["teamid"].to_numpy(dtype=object)
+    known = t["teamid"].notna().to_numpy()
 
-    def _weighted_team_elo(team_id: str) -> dict[str, float]:
-        lineup = _live_team_lineup(current, team_id, season)
-        if lineup.empty:
-            return {s: _ELO_INITIAL for s in all_skills}
-
-        weights: list[float] = []
-        vals: dict[str, list] = {s: [] for s in all_skills}
-        for _, row in lineup.iterrows():
-            pid = str(row["player_id"])
-            weights.append(ppg_lookup.get(pid, 5.0))
-            for s in ELO_SKILLS:
-                vals[s].append(float(row[f"{s}_elo"]))
-            vals["general"].append(float(row["general_elo"]))
-
-        total_w = sum(weights)
-        return {
-            s: sum(v * w for v, w in zip(vals[s], weights)) / total_w
-            for s in all_skills
-        }
-
-    home_elo = _weighted_team_elo(home_team_id)
-    away_elo = _weighted_team_elo(away_team_id)
-
-    features: dict = {}
-    for s in all_skills:
-        features[f"home_{s}_elo"] = home_elo[s]
-        features[f"away_{s}_elo"] = away_elo[s]
-        features[f"elo_{s}_diff"] = home_elo[s] - away_elo[s]
-    return features
+    teams, pos = {}, np.flatnonzero(known)
+    for tid, rows in t[known].groupby("teamid").indices.items():
+        rows = pos[rows]
+        last_dom = np.where(domestic[rows], np.arange(len(rows)), -1)
+        teams[tid] = {"day": day[rows], "stats": stats[rows], "blue": blue[rows], "opp": opp[rows],
+                      "league": league[rows], "starters": [starters[i] for i in rows],
+                      "home": np.maximum.accumulate(last_dom)}
+    dom = np.flatnonzero(known & domestic)
+    leagues = {lg: (day[dom[rows]], teamid[dom[rows]])
+               for lg, rows in pd.Series(league[dom]).groupby(league[dom]).indices.items()}
+    ix = {"teams": teams, "games": dict(zip(keys, starters)), "leagues": leagues, "lmean": {}}
+    _cache["tg"] = (tg, ix)
+    return ix
 
 
-def get_elo_features(
-    game_id: str,
-    home_team_id: str,
-    away_team_id: str,
-    player_stats_df: pd.DataFrame,
-    use_current: bool = False,
-    season: str | None = None,
-    prev_player_stats_df: pd.DataFrame | None = None,
-) -> dict:
-    """
-    Compute usage-weighted team ELO per skill + home/away differentials.
+_EMPTY_TEAM = {"day": np.empty(0, np.int64), "stats": np.empty((0, len(STAT_NAMES))),
+               "blue": np.empty(0, bool), "opp": np.empty(0, object), "league": np.empty(0, object),
+               "starters": [], "home": np.empty(0, np.int64)}
 
-    Each team's composite ELO is the PPG-weighted average of its active
-    players' ELOs. Inactive players (from the summary file) are excluded
-    before weighting so injuries are automatically reflected.
 
-    Args:
-        game_id:         NBA game ID (10-digit string)
-        home_team_id:    NBA team ID for home team
-        away_team_id:    NBA team ID for away team
-        player_stats_df: Season player stats (for PPG weights)
-        use_current:     True for live predictions — builds each team's lineup from
-                         the ELO state (post-game player_elo_current) instead of
-                         from this game's box score, which does not exist yet.
-        season:          current season string (live mode only)
-        prev_player_stats_df: previous-season player stats (live PPG fallback)
+def _prior(g: "_Game", team_id) -> tuple[dict, int]:
+    """(the team's index arrays, number of its rows before g.day)."""
+    t = g.ix["teams"].get(team_id, _EMPTY_TEAM)
+    return t, int(np.searchsorted(t["day"], g.day))
 
-    Returns features:
-        home_{skill}_elo, away_{skill}_elo, elo_{skill}_diff  × 8 skills
-    """
-    if use_current:
-        return _get_elo_features_live(
-            home_team_id, away_team_id, season, player_stats_df, prev_player_stats_df
-        )
 
-    game_elos = _get_elo_by_game().get(game_id, pd.DataFrame())
+def _home_league(g: "_Game", team_id):
+    """The team's most recent non-international league before g.day (within 365 days), or None."""
+    t, n = _prior(g, team_id)
+    k = t["home"][n - 1] if n else -1
+    return t["league"][k] if k >= 0 and t["day"][k] >= g.day - YEAR_DAYS else None
 
-    # player_id → {skill: elo}
-    elo_lookup: dict[str, dict] = {}
-    for _, row in game_elos.iterrows():
-        pid = str(row["player_id"])
-        elo_lookup[pid] = {s: float(row[f"pre_{s}_elo"]) for s in ELO_SKILLS}
-        elo_lookup[pid]["general"] = float(row["pre_general_elo"])
 
-    # player_id → PPG weight (default 5.0 for unknown players)
-    ppg_lookup: dict[str, float] = {}
-    if player_stats_df is not None and not player_stats_df.empty:
-        for _, row in player_stats_df.iterrows():
-            pid = str(int(row["PLAYER_ID"]))
-            ppg_lookup[pid] = max(float(row.get("PTS", 5.0)), 1.0)
+@dataclass
+class _Game:
+    ix: dict
+    st: dict
+    day: int
+    live: bool
+    blue: str
+    red: str
+    blue_starters: tuple
+    red_starters: tuple
+    league: str
+    playoffs: int
 
-    all_skills = ELO_SKILLS + ["general"]
 
-    def _weighted_team_elo(team_id: str) -> dict[str, float]:
-        player_ids = _load_team_player_ids(game_id, team_id)
-        inactive   = _load_inactive_ids(game_id, team_id)
-        active     = player_ids - inactive
-
-        vals:    dict[str, list] = {s: [] for s in all_skills}
-        weights: list[float] = []
-
-        for pid in active:
-            if pid not in elo_lookup:
-                continue
-            w = ppg_lookup.get(pid, 5.0)
-            weights.append(w)
-            for s in all_skills:
-                vals[s].append(elo_lookup[pid][s])
-
-        if not weights:
-            return {s: _ELO_INITIAL for s in all_skills}
-
-        total_w = sum(weights)
-        return {
-            s: sum(v * w for v, w in zip(vals[s], weights)) / total_w
-            for s in all_skills
-        }
-
-    home_elo = _weighted_team_elo(home_team_id)
-    away_elo = _weighted_team_elo(away_team_id)
-
-    features: dict = {}
-    for s in all_skills:
-        features[f"home_{s}_elo"] = home_elo[s]
-        features[f"away_{s}_elo"] = away_elo[s]
-        features[f"elo_{s}_diff"] = home_elo[s] - away_elo[s]
-
-    return features
+def _pair(b: dict, r: dict) -> dict:
+    return ({f"blue_{k}": v for k, v in b.items()} | {f"red_{k}": v for k, v in r.items()}
+            | {f"diff_{k}": b[k] - r[k] for k in b})
 
 
 # ---------------------------------------------------------------------------
-# 2. Team rolling stats
+# Feature groups
 # ---------------------------------------------------------------------------
 
-def get_team_rolling_stats(
-    team_id: str,
-    game_date: str,
-    game_log_df: pd.DataFrame,
-) -> dict:
+def get_elo_features(g: _Game) -> dict:
+    """Starter means of the VALS ELOs per team + diffs, and per-role general/outcome lane diffs."""
+    b, r = _lineup(g, g.blue_starters, g.blue), _lineup(g, g.red_starters, g.red)
+    out = _pair(dict(zip([f"{v}_elo" for v in VALS], _nanmean(b))),
+                dict(zip([f"{v}_elo" for v in VALS], _nanmean(r))))
+    for i, role in enumerate(oe.ROLES):
+        out[f"diff_{role}_general_elo"] = b[i, 1] - r[i, 1]
+        out[f"diff_{role}_outcome_elo"] = b[i, 0] - r[i, 0]
+    return out
+
+
+def get_team_rolling_stats(g: _Game) -> dict:
+    def one(team_id):
+        t, n = _prior(g, team_id)
+        out = {}
+        for w in ROLL_WINDOWS:
+            out.update({f"{s}_last{w}": v
+                        for s, v in zip(STAT_NAMES, _nanmean(t["stats"][max(n - w, 0):n]))})
+        return out
+    return _pair(one(g.blue), one(g.red))
+
+
+def get_side_splits(g: _Game) -> dict:
+    def one(team_id):
+        t, n = _prior(g, team_id)
+        lo = int(np.searchsorted(t["day"], g.day - YEAR_DAYS))
+        res, blue = t["stats"][lo:n, 0], t["blue"][lo:n]
+        return {"win_pct_on_blue": _mean(res[blue]), "win_pct_on_red": _mean(res[~blue])}
+    b, r = one(g.blue), one(g.red)
+    out = _pair(b, r)
+    out["blue_win_pct_own_side"] = b["win_pct_on_blue"]
+    out["red_win_pct_own_side"] = r["win_pct_on_red"]
+    out["diff_win_pct_own_side"] = b["win_pct_on_blue"] - r["win_pct_on_red"]
+    return out
+
+
+def get_rest_features(g: _Game) -> dict:
+    def one(team_id):
+        t, n = _prior(g, team_id)
+        return {"days_since_last": g.day - t["day"][n - 1] if n else np.nan,
+                "games_last_7": n - int(np.searchsorted(t["day"], g.day - REST_WINDOW))}
+    return _pair(one(g.blue), one(g.red))
+
+
+def get_head_to_head_features(g: _Game) -> dict:
+    t, n = _prior(g, g.blue)
+    lo = int(np.searchsorted(t["day"], g.day - YEAR_DAYS))
+    met = t["opp"][lo:n] == g.red
+    games, wins = int(met.sum()), float(t["stats"][lo:n, 0][met].sum())
+    return {"h2h_games": games, "h2h_blue_wins": wins,
+            "h2h_blue_win_pct": wins / games if games else np.nan}
+
+
+def get_roster_features(g: _Game) -> dict:
+    def one(team_id, starters):
+        t, n = _prior(g, team_id)
+        churn = (len({p for p in t["starters"][n - 1] if p} & {p for p in t["starters"][n - 2] if p})
+                 if n >= 2 else np.nan)
+        rookies = sum(_player(g, p)[1] < ROOKIE_GAMES for p in starters if p)
+        return {"roster_churn": churn, "rookie_count": rookies}
+    return _pair(one(g.blue, g.blue_starters), one(g.red, g.red_starters))
+
+
+def get_player_form_features(g: _Game) -> dict:
+    """Mean over starters of (ELO as of today - pre-game ELO FORM_N games ago, or first game)."""
+    def one(starters):
+        deltas = []
+        for pid in starters:
+            s = g.st["snaps"].get(pid) if pid else None
+            n = int(np.searchsorted(s[0], g.day)) if s is not None else 0
+            if n:
+                deltas.append(_player(g, pid)[0][:2] - s[1][max(n - FORM_N, 0), :2])
+        m = np.mean(deltas, axis=0) if deltas else (np.nan, np.nan)
+        return {"form_outcome_elo": m[0], "form_general_elo": m[1]}
+    return _pair(one(g.blue_starters), one(g.red_starters))
+
+
+def get_streak_features(g: _Game) -> dict:
+    def one(team_id):
+        t, n = _prior(g, team_id)
+        res = t["stats"][:n, 0]
+        k = 0
+        while k < n and res[n - 1 - k] == res[n - 1]:
+            k += 1
+        return {"streak": k if n and res[n - 1] == 1 else -k}
+    return _pair(one(g.blue), one(g.red))
+
+
+def _league_mean(g: _Game, league) -> float:
     """
-    Rolling team stats (last-5 and last-10 games) entering a game.
-
-    Returns keys: pts_last5, pts_last10, opp_pts_last5, opp_pts_last10,
-                  net_last5, net_last10, win_pct_last5, win_pct_last10,
-                  ast_last5, reb_last5, tov_last5
+    Mean team strength of the league as of g.day: over every team whose home league
+    is `league`, strength = mean as-of outcome ELO of its last lineup. Cached per day.
     """
-    team  = game_log_df[game_log_df["TEAM_ID"] == int(team_id)].copy()
-    team["GAME_DATE"] = pd.to_datetime(team["GAME_DATE"])
-    target = pd.to_datetime(game_date)
-    prior  = team[team["GAME_DATE"] < target].sort_values("GAME_DATE")
-
-    features: dict = {}
-
-    for window, suffix in [(5, "last5"), (10, "last10")]:
-        recent = prior.tail(window)
-        if recent.empty:
-            for key in ["pts", "opp_pts", "net", "win_pct"]:
-                features[f"{key}_{suffix}"] = 0.0
-            continue
-
-        pts     = recent["PTS"].mean()
-        net     = recent["PLUS_MINUS"].mean()
-        opp_pts = pts - net                          # opp_pts = PTS - PLUS_MINUS
-        wins    = (recent["WL"] == "W").mean()
-
-        features[f"pts_{suffix}"]     = float(pts)
-        features[f"opp_pts_{suffix}"] = float(opp_pts)
-        features[f"net_{suffix}"]     = float(net)
-        features[f"win_pct_{suffix}"] = float(wins)
-
-    # Additional stats (last-5 only — enough signal, keeps feature count down)
-    recent5 = prior.tail(5)
-    for col, key in [("AST", "ast_last5"), ("REB", "reb_last5"), ("TOV", "tov_last5")]:
-        features[key] = float(recent5[col].mean()) if not recent5.empty and col in recent5.columns else 0.0
-
-    return features
-
-
-# ---------------------------------------------------------------------------
-# 3. Home / away splits
-# ---------------------------------------------------------------------------
-
-def get_home_away_splits(
-    team_id: str,
-    season: str,
-    game_log_df: pd.DataFrame,
-    game_date: str | None = None,
-) -> dict:
-    """
-    Season-to-date home vs away performance splits (only prior games).
-
-    Returns: win_pct_home, pts_avg_home, opp_pts_avg_home,
-             win_pct_away, pts_avg_away, opp_pts_avg_away,
-             home_away_win_pct_diff
-    """
-    home_games, away_games = split_home_away(team_id, game_log_df, game_date=game_date)
-
-    def _split_stats(games: pd.DataFrame, label: str) -> dict:
-        if games.empty:
-            return {f"win_pct_{label}": 0.5, f"pts_avg_{label}": 110.0,
-                    f"opp_pts_avg_{label}": 110.0}
-        net  = games["PLUS_MINUS"].mean()
-        pts  = games["PTS"].mean()
-        return {
-            f"win_pct_{label}":     float((games["WL"] == "W").mean()),
-            f"pts_avg_{label}":     float(pts),
-            f"opp_pts_avg_{label}": float(pts - net),
-        }
-
-    features = {}
-    features.update(_split_stats(home_games, "home"))
-    features.update(_split_stats(away_games, "away"))
-    features["home_away_win_pct_diff"] = (
-        features["win_pct_home"] - features["win_pct_away"]
-    )
-    return features
-
-
-# ---------------------------------------------------------------------------
-# 4. Rest and schedule
-# ---------------------------------------------------------------------------
-
-def get_rest_features(
-    team_id: str,
-    game_date: str,
-    game_log_df: pd.DataFrame,
-) -> dict:
-    """
-    Rest and schedule density features.
-
-    Returns: days_rest, is_back_to_back, games_last_7
-    """
-    rest   = days_rest_calculator(team_id, game_date, game_log_df)
-    b2b    = is_back_to_back(team_id, game_date, game_log_df)
-
-    team   = game_log_df[game_log_df["TEAM_ID"] == int(team_id)].copy()
-    team["GAME_DATE"] = pd.to_datetime(team["GAME_DATE"])
-    target = pd.to_datetime(game_date)
-    window_start = target - pd.Timedelta(days=7)
-    games_last_7 = int(
-        ((team["GAME_DATE"] >= window_start) & (team["GAME_DATE"] < target)).sum()
-    )
-
-    return {
-        "days_rest":      rest,
-        "is_back_to_back": b2b,
-        "games_last_7":   games_last_7,
-    }
-
-
-# ---------------------------------------------------------------------------
-# 5. Head-to-head
-# ---------------------------------------------------------------------------
-
-def get_head_to_head_features(
-    home_team_id: str,
-    away_team_id: str,
-    season: str,
-    game_log_df: pd.DataFrame,
-    game_date: str | None = None,
-) -> dict:
-    """
-    Head-to-head record between the two teams this season (only prior games).
-
-    Returns: h2h_home_wins, h2h_away_wins, h2h_home_win_pct
-    """
-    home_id = int(home_team_id)
-    away_id = int(away_team_id)
-
-    log = game_log_df.copy()
-    if game_date is not None:
-        log["GAME_DATE"] = pd.to_datetime(log["GAME_DATE"])
-        log = log[log["GAME_DATE"] < pd.to_datetime(game_date)]
-
-    # Find game_ids where both teams appear
-    home_games = set(log[log["TEAM_ID"] == home_id]["GAME_ID"])
-    away_games = set(log[log["TEAM_ID"] == away_id]["GAME_ID"])
-    shared_ids = home_games & away_games
-
-    if not shared_ids:
-        return {"h2h_home_wins": 0, "h2h_away_wins": 0, "h2h_home_win_pct": 0.5}
-
-    h2h = game_log_df[
-        (game_log_df["GAME_ID"].isin(shared_ids)) &
-        (game_log_df["TEAM_ID"] == home_id)
-    ]
-
-    home_wins = int((h2h["WL"] == "W").sum())
-    away_wins = int((h2h["WL"] == "L").sum())
-    total     = home_wins + away_wins
-
-    return {
-        "h2h_home_wins":    home_wins,
-        "h2h_away_wins":    away_wins,
-        "h2h_home_win_pct": home_wins / total if total > 0 else 0.5,
-    }
-
-
-# ---------------------------------------------------------------------------
-# 6. Player availability
-# ---------------------------------------------------------------------------
-
-def get_player_availability_features(
-    team_id: str,
-    game_id: str,
-    player_stats_df: pd.DataFrame,
-) -> dict:
-    """
-    Estimate the impact of missing players on team strength.
-
-    Returns: star_player_out (1 if 20+ PPG player is inactive),
-             missing_ppg (total PPG of inactive players),
-             availability_score (active PPG / total roster PPG, 0–1)
-
-    Live-mode note: there is no injury/inactives source for a game that has not been
-    played (the box-score summary file does not exist yet), so these features stay
-    neutral (star_player_out=0, missing_ppg=0, availability_score=1.0). Wire up an
-    injury feed here if per-game availability is wanted for live predictions.
-    """
-    inactive_ids = _load_inactive_ids(game_id, team_id)
-
-    if player_stats_df is None or player_stats_df.empty:
-        return {"star_player_out": 0, "missing_ppg": 0.0, "availability_score": 1.0}
-
-    # Filter to players on this team
-    team_stats = player_stats_df[
-        player_stats_df["TEAM_ID"].astype(str) == str(team_id)
-    ].copy()
-
-    if team_stats.empty:
-        return {"star_player_out": 0, "missing_ppg": 0.0, "availability_score": 1.0}
-
-    total_ppg   = float(team_stats["PTS"].sum())
-    team_stats["pid_str"] = team_stats["PLAYER_ID"].astype(int).astype(str)
-    inactive_rows = team_stats[team_stats["pid_str"].isin(inactive_ids)]
-
-    missing_ppg  = float(inactive_rows["PTS"].sum())
-    star_out     = int((inactive_rows["PTS"] >= 20.0).any())
-    avail_score  = (total_ppg - missing_ppg) / total_ppg if total_ppg > 0 else 1.0
-
-    return {
-        "star_player_out":    star_out,
-        "missing_ppg":        missing_ppg,
-        "availability_score": float(np.clip(avail_score, 0.0, 1.0)),
-    }
-
-
-# ---------------------------------------------------------------------------
-# 7. Efficiency differential
-# ---------------------------------------------------------------------------
-
-def get_efficiency_differential_features(
-    home_team_id: str,
-    away_team_id: str,
-    game_log_df: pd.DataFrame,
-    game_date: str,
-) -> dict:
-    """
-    Offensive vs defensive net rating matchup (last-10 proxy).
-
-    home_off_vs_away_def_diff: home rolling pts/game − away rolling opp_pts/game
-    away_off_vs_home_def_diff: away rolling pts/game − home rolling opp_pts/game
-    net_efficiency_advantage:  home rolling net − away rolling net
-    """
-    def _rolling(team_id: str, window: int = 10) -> dict:
-        team   = game_log_df[game_log_df["TEAM_ID"] == int(team_id)].copy()
-        team["GAME_DATE"] = pd.to_datetime(team["GAME_DATE"])
-        target = pd.to_datetime(game_date)
-        recent = (
-            team[team["GAME_DATE"] < target]
-            .sort_values("GAME_DATE")
-            .tail(window)
-        )
-        if recent.empty:
-            return {"pts": 110.0, "opp_pts": 110.0, "net": 0.0}
-        pts = float(recent["PTS"].mean())
-        net = float(recent["PLUS_MINUS"].mean())
-        return {"pts": pts, "opp_pts": pts - net, "net": net}
-
-    home = _rolling(home_team_id)
-    away = _rolling(away_team_id)
-
-    return {
-        "home_off_vs_away_def_diff": home["pts"]     - away["opp_pts"],
-        "away_off_vs_home_def_diff": away["pts"]     - home["opp_pts"],
-        "net_efficiency_advantage":  home["net"]      - away["net"],
-    }
-
-
-# ---------------------------------------------------------------------------
-# 8. Player form (ELO trajectory)
-# ---------------------------------------------------------------------------
-
-def get_player_form_features(
-    team_id: str,
-    game_id: str,
-    game_date: str,
-    player_stats_df: pd.DataFrame,
-    n_games: int = 10,
-    use_current: bool = False,
-) -> dict:
-    """
-    Measure recent form of top players via ELO trajectory.
-
-    Finds the top 3 players on the team by PPG, then measures how much
-    their general ELO changed over the last n_games. A rising ELO means
-    they've been outperforming peers recently.
-
-    In live mode (use_current) the trajectory is read from the small recent-snapshot
-    state file instead of the full ELO history (which is not shipped to the runner).
-
-    Returns: top{1,2,3}_elo_trend, avg_top3_elo_trend
-    """
-    elo_by_player = _get_elo_recent_by_player() if use_current else _get_elo_by_player()
-
-    # Get top 3 players by PPG for this team
-    if player_stats_df is None or player_stats_df.empty:
-        return {"top1_elo_trend": 0.0, "top2_elo_trend": 0.0,
-                "top3_elo_trend": 0.0, "avg_top3_elo_trend": 0.0}
-
-    team_stats = player_stats_df[
-        player_stats_df["TEAM_ID"].astype(str) == str(team_id)
-    ].nlargest(3, "PTS")
-
-    trends: list[float] = []
-
-    for _, row in team_stats.iterrows():
-        pid = str(int(row["PLAYER_ID"]))
-        player_history = elo_by_player.get(pid)
-        if player_history is None:
-            trends.append(0.0)
-            continue
-        # Games strictly before this game
-        before = player_history[
-            player_history["game_date"] < pd.to_datetime(game_date)
-        ]
-
-        if len(before) < 2:
-            trends.append(0.0)
-            continue
-
-        recent    = float(before["pre_general_elo"].iloc[-1])
-        past      = float(before["pre_general_elo"].iloc[max(-n_games - 1, -len(before))])
-        trends.append(recent - past)
-
-    # Pad to 3 if fewer than 3 players found
-    while len(trends) < 3:
-        trends.append(0.0)
-
-    return {
-        "top1_elo_trend":     trends[0],
-        "top2_elo_trend":     trends[1],
-        "top3_elo_trend":     trends[2],
-        "avg_top3_elo_trend": float(np.mean(trends)),
-    }
-
-
-# ---------------------------------------------------------------------------
-# 9. Streak features
-# ---------------------------------------------------------------------------
-
-def get_streak_features(
-    team_id: str,
-    game_date: str,
-    game_log_df: pd.DataFrame,
-) -> dict:
-    """
-    Win/loss streak and recent win percentage entering a game.
-
-    Returns: win_streak, loss_streak, last5_win_pct
-    """
-    team   = game_log_df[game_log_df["TEAM_ID"] == int(team_id)].copy()
-    team["GAME_DATE"] = pd.to_datetime(team["GAME_DATE"])
-    target = pd.to_datetime(game_date)
-    prior  = (
-        team[team["GAME_DATE"] < target]
-        .sort_values("GAME_DATE")["WL"]
-        .tolist()
-    )
-
-    win_streak = loss_streak = 0
-    if prior:
-        last = prior[-1]
-        for result in reversed(prior):
-            if result == last:
-                if last == "W":
-                    win_streak += 1
-                else:
-                    loss_streak += 1
-            else:
-                break
-
-    last5       = prior[-5:] if len(prior) >= 5 else prior
-    last5_win_pct = sum(r == "W" for r in last5) / len(last5) if last5 else 0.5
-
-    return {
-        "win_streak":      win_streak,
-        "loss_streak":     loss_streak,
-        "last5_win_pct":   last5_win_pct,
-    }
+    if league is None:
+        return np.nan
+    key = (league, g.day, g.live)
+    if key not in g.ix["lmean"]:
+        days, teams = g.ix["leagues"].get(league, (np.empty(0, np.int64), np.empty(0, object)))
+        lo, hi = np.searchsorted(days, [g.day - YEAR_DAYS, g.day])
+        strengths = []
+        for tid in dict.fromkeys(teams[lo:hi]):        # ordered unique
+            if _home_league(g, tid) == league:
+                t, n = _prior(g, tid)
+                s = _nanmean(_lineup(g, t["starters"][n - 1], tid)[:, :1])[0]
+                if not np.isnan(s):
+                    strengths.append(s)
+        g.ix["lmean"][key] = float(np.mean(strengths)) if strengths else np.nan
+    return g.ix["lmean"][key]
+
+
+def get_context_features(g: _Game) -> dict:
+    out = {"is_international": g.league in elo.INTERNATIONAL, "playoffs": g.playoffs,
+           "league_tier": elo.LEAGUE_PRIOR.get(g.league, elo.DEFAULT_PRIOR)}
+    out.update(_pair({"league_mean_outcome_elo": _league_mean(g, _home_league(g, g.blue))},
+                     {"league_mean_outcome_elo": _league_mean(g, _home_league(g, g.red))}))
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _starters(g: _Game, team_id, side: str, game_id) -> tuple:
+    """Training: who played game_id on that side. Live: the team's latest lineup before g.day."""
+    if not g.live and game_id is not None:
+        return g.ix["games"].get((game_id, side), _NO_STARTERS)
+    t, n = _prior(g, team_id)
+    return t["starters"][n - 1] if n else _NO_STARTERS
+
+
 def build_feature_matrix(
-    game_id: str,
-    home_team_id: str,
-    away_team_id: str,
-    game_date: str,
-    season: str,
-    game_log_df: pd.DataFrame,
-    player_stats_df: pd.DataFrame,
-    use_current_elo: bool = False,
-    prev_player_stats_df: pd.DataFrame | None = None,
+    blue_team_id: str,
+    red_team_id: str,
+    game_date,
+    context: dict,
+    team_games_df: pd.DataFrame,
+    use_current_elo: bool,
+    game_id: str | None = None,
+    blue_starters=None,
+    red_starters=None,
 ) -> dict[str, float]:
     """
-    Build a single flat feature dict for one game, ready for XGBoost.
-
-    All features are prefixed with "home_" or "away_" where applicable.
-    Differential features (home − away) are included for key metrics.
+    One flat feature dict for one game, blue side vs red side.
 
     Args:
-        game_id:          NBA 10-digit game ID
-        home_team_id:     NBA team ID for home team
-        away_team_id:     NBA team ID for away team
-        game_date:        ISO date string "YYYY-MM-DD"
-        season:           Season string e.g. "2023-24"
-        game_log_df:      Combined game log DataFrame (all seasons / types)
-        player_stats_df:  Season player stats DataFrame for this season
-        use_current_elo:  True when predicting today's games (no future games yet)
+        blue_team_id / red_team_id: OE teamids.
+        game_date:       the game's date (anything pd.Timestamp parses); only the day counts.
+        context:         {"league": OE league code of the game, "playoffs": 0/1}.
+        team_games_df:   oe.TEAM_GAMES_COLS rows (see module docstring).
+        use_current_elo: False = training (history snapshots), True = live (current state).
+        game_id:         training: the OE gameid whose actual starters are used.
+        blue_starters / red_starters: 5 playerids in role order (None/"" = empty slot);
+                         overrides the default lineup.
 
-    Returns:
-        dict[str, float] — flat feature vector, human-readable keys
+    Every group runs in its own try/except; a failing group's keys are just missing.
     """
+    g = _Game(ix=_team_index(team_games_df), st=_elo_state(use_current_elo), day=_day(game_date),
+              live=use_current_elo, blue=blue_team_id, red=red_team_id, blue_starters=_NO_STARTERS,
+              red_starters=_NO_STARTERS, league=context["league"], playoffs=int(context["playoffs"]))
+    g.blue_starters = (_parse_starters(blue_starters) if blue_starters is not None
+                       else _starters(g, blue_team_id, "Blue", game_id))
+    g.red_starters = (_parse_starters(red_starters) if red_starters is not None
+                      else _starters(g, red_team_id, "Red", game_id))
+
     features: dict = {}
-
-    # ELO (most important feature group)
-    try:
-        elo = get_elo_features(
-            game_id, home_team_id, away_team_id,
-            player_stats_df, use_current=use_current_elo,
-            season=season, prev_player_stats_df=prev_player_stats_df,
-        )
-        features.update(elo)
-    except Exception as exc:
-        logger.warning("elo_features %s: %s", game_id, exc)
-
-    # Rolling team stats
-    for prefix, team_id in [("home", home_team_id), ("away", away_team_id)]:
+    for group in (get_elo_features, get_team_rolling_stats, get_side_splits, get_rest_features,
+                  get_head_to_head_features, get_roster_features, get_player_form_features,
+                  get_streak_features, get_context_features):
         try:
-            rolling = get_team_rolling_stats(team_id, game_date, game_log_df)
-            features.update({f"{prefix}_{k}": v for k, v in rolling.items()})
+            features.update(group(g))
         except Exception as exc:
-            logger.warning("rolling_stats %s %s: %s", prefix, game_id, exc)
-
-    # Rolling stat differentials (home − away)
-    for key in ["pts_last5", "pts_last10", "net_last5", "net_last10",
-                "win_pct_last5", "win_pct_last10"]:
-        h = features.get(f"home_{key}", 0.0)
-        a = features.get(f"away_{key}", 0.0)
-        features[f"diff_{key}"] = h - a
-
-    # Home/away splits
-    for prefix, team_id in [("home", home_team_id), ("away", away_team_id)]:
-        try:
-            splits = get_home_away_splits(team_id, season, game_log_df, game_date=game_date)
-            features.update({f"{prefix}_{k}": v for k, v in splits.items()})
-        except Exception as exc:
-            logger.warning("splits %s %s: %s", prefix, game_id, exc)
-
-    # Rest / schedule
-    for prefix, team_id in [("home", home_team_id), ("away", away_team_id)]:
-        try:
-            rest = get_rest_features(team_id, game_date, game_log_df)
-            features.update({f"{prefix}_{k}": v for k, v in rest.items()})
-        except Exception as exc:
-            logger.warning("rest %s %s: %s", prefix, game_id, exc)
-
-    features["rest_diff"] = (
-        features.get("home_days_rest", 0) - features.get("away_days_rest", 0)
-    )
-    features["b2b_diff"] = (
-        features.get("home_is_back_to_back", 0) - features.get("away_is_back_to_back", 0)
-    )
-
-    # Head-to-head
-    try:
-        h2h = get_head_to_head_features(
-            home_team_id, away_team_id, season, game_log_df, game_date=game_date
-        )
-        features.update(h2h)
-    except Exception as exc:
-        logger.warning("h2h %s: %s", game_id, exc)
-
-    # Player availability
-    for prefix, team_id in [("home", home_team_id), ("away", away_team_id)]:
-        try:
-            avail = get_player_availability_features(team_id, game_id, player_stats_df)
-            features.update({f"{prefix}_{k}": v for k, v in avail.items()})
-        except Exception as exc:
-            logger.warning("availability %s %s: %s", prefix, game_id, exc)
-
-    # Efficiency differential
-    try:
-        eff = get_efficiency_differential_features(
-            home_team_id, away_team_id, game_log_df, game_date
-        )
-        features.update(eff)
-    except Exception as exc:
-        logger.warning("efficiency %s: %s", game_id, exc)
-
-    # Player form (ELO trajectory)
-    for prefix, team_id in [("home", home_team_id), ("away", away_team_id)]:
-        try:
-            form = get_player_form_features(
-                team_id, game_id, game_date, player_stats_df,
-                use_current=use_current_elo,
-            )
-            features.update({f"{prefix}_{k}": v for k, v in form.items()})
-        except Exception as exc:
-            logger.warning("form %s %s: %s", prefix, game_id, exc)
-
-    # Streaks
-    for prefix, team_id in [("home", home_team_id), ("away", away_team_id)]:
-        try:
-            streak = get_streak_features(team_id, game_date, game_log_df)
-            features.update({f"{prefix}_{k}": v for k, v in streak.items()})
-        except Exception as exc:
-            logger.warning("streak %s %s: %s", prefix, game_id, exc)
-
+            logger.warning("%s %s %s-%s: %s", getattr(group, "__name__", group), game_id,
+                           blue_team_id, red_team_id, exc)
     return {k: float(v) for k, v in features.items()}
 
 
-# ---------------------------------------------------------------------------
-# Helper utilities
-# ---------------------------------------------------------------------------
-
-def rolling_window(series: pd.Series, window: int) -> float:
-    valid = series.dropna()
-    if len(valid) < window:
-        return float("nan")
-    return float(valid.iloc[-window:].mean())
-
-
-def split_home_away(
-    team_id: str, game_log_df: pd.DataFrame, game_date: str | None = None
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split a team's game log into home and away games, optionally capped before game_date."""
-    team_games = game_log_df[game_log_df["TEAM_ID"] == int(team_id)].copy()
-    if game_date is not None:
-        team_games["GAME_DATE"] = pd.to_datetime(team_games["GAME_DATE"])
-        team_games = team_games[team_games["GAME_DATE"] < pd.to_datetime(game_date)]
-    home_mask = team_games["MATCHUP"].str.contains(" vs. ", na=False)
-    return team_games[home_mask], team_games[~home_mask]
-
-
-def days_rest_calculator(
-    team_id: str, game_date: str, game_log_df: pd.DataFrame
-) -> int:
-    """Days between the team's last game and game_date. Returns 7 if no prior game."""
-    team = game_log_df[game_log_df["TEAM_ID"] == int(team_id)].copy()
-    team["GAME_DATE"] = pd.to_datetime(team["GAME_DATE"])
-    target = pd.to_datetime(game_date)
-    prior  = team[team["GAME_DATE"] < target].sort_values("GAME_DATE")
-    if prior.empty:
-        return 7
-    return int((target - prior.iloc[-1]["GAME_DATE"]).days - 1)
-
-
-def is_back_to_back(
-    team_id: str, game_date: str, game_log_df: pd.DataFrame
-) -> int:
-    """Return 1 if team played yesterday, else 0."""
-    return int(days_rest_calculator(team_id, game_date, game_log_df) == 0)
+def series_win_prob(p: float, best_of: int) -> float:
+    """
+    P(winning a best-of-n series) = P(first to ceil(n/2) wins) with per-game win prob p.
+    Bo1 p, Bo3 p^2(3-2p), Bo5 p^3(10-15p+6p^2).
+    """
+    # ponytail: iid games, ignores momentum and side alternation
+    need = math.ceil(best_of / 2)
+    return sum(math.comb(need - 1 + k, k) * p ** need * (1 - p) ** k for k in range(need))
