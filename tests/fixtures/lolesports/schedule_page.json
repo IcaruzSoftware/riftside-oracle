@@ -1,0 +1,197 @@
+{
+ "data": {
+  "schedule": {
+   "pages": {
+    "older": "b2xkZXI6OjExMzQ3NTc5ODAwNjU5OTAzNA==",
+    "newer": "bmV3ZXI6OjExNTY2MDU0MDcyNjA5NTA5Nw=="
+   },
+   "events": [
+    {
+     "startTime": "2025-11-09T07:00:00Z",
+     "state": "completed",
+     "type": "match",
+     "blockName": "Finals",
+     "league": {
+      "name": "Worlds",
+      "slug": "worlds"
+     },
+     "match": {
+      "id": "113475871524050783",
+      "flags": [
+       "hasVod",
+       "isSpoiler"
+      ],
+      "teams": [
+       {
+        "name": "T1",
+        "code": "T1",
+        "image": "http://static.lolesports.com/teams/1726801573959_539px-T1_2019_full_allmode.png",
+        "result": {
+         "outcome": "win",
+         "gameWins": 3
+        },
+        "record": {
+         "wins": 3,
+         "losses": 0
+        }
+       },
+       {
+        "name": "kt Rolster",
+        "code": "KT",
+        "image": "http://static.lolesports.com/teams/kt_darkbackground.png",
+        "result": {
+         "outcome": "loss",
+         "gameWins": 2
+        },
+        "record": {
+         "wins": 2,
+         "losses": 1
+        }
+       }
+      ],
+      "strategy": {
+       "type": "bestOf",
+       "count": 5
+      }
+     }
+    },
+    {
+     "startTime": "2026-10-15T17:00:00Z",
+     "state": "unstarted",
+     "type": "show",
+     "blockName": "Opening Ceremony",
+     "league": {
+      "name": "Worlds",
+      "slug": "worlds"
+     }
+    },
+    {
+     "startTime": "2026-10-15T18:00:00Z",
+     "state": "unstarted",
+     "type": "match",
+     "blockName": "Play-Ins",
+     "league": {
+      "name": "Worlds",
+      "slug": "worlds"
+     },
+     "match": {
+      "id": "115660588583171786",
+      "flags": [],
+      "teams": [
+       {
+        "name": "Cloud9 Kia",
+        "code": "C9",
+        "image": "http://static.lolesports.com/teams/1736924120254_C9Kia_IconBlue_Transparent_2000x2000.png",
+        "result": {
+         "outcome": null,
+         "gameWins": 0
+        },
+        "record": {
+         "wins": 0,
+         "losses": 0
+        }
+       },
+       {
+        "name": "Karmine Corp",
+        "code": "KC",
+        "image": "http://static.lolesports.com/teams/1704714951336_KC.png",
+        "result": {
+         "outcome": null,
+         "gameWins": 0
+        },
+        "record": {
+         "wins": 0,
+         "losses": 0
+        }
+       }
+      ],
+      "strategy": {
+       "type": "bestOf",
+       "count": 5
+      }
+     }
+    },
+    {
+     "startTime": "2026-10-15T23:00:00Z",
+     "state": "unstarted",
+     "type": "match",
+     "blockName": "Play-Ins",
+     "league": {
+      "name": "Worlds",
+      "slug": "worlds"
+     },
+     "match": {
+      "id": "115660588583040710",
+      "flags": [],
+      "teams": [
+       {
+        "name": "FURIA",
+        "code": "FUR",
+        "image": "http://static.lolesports.com/teams/FURIA---black.png",
+        "result": {
+         "outcome": null,
+         "gameWins": 0
+        },
+        "record": {
+         "wins": 0,
+         "losses": 0
+        }
+       },
+       {
+        "name": "MVK Esports",
+        "code": "MVK",
+        "image": "http://static.lolesports.com/teams/1767089709161_White_Logo.png",
+        "result": {
+         "outcome": null,
+         "gameWins": 0
+        },
+        "record": {
+         "wins": 0,
+         "losses": 0
+        }
+       }
+      ],
+      "strategy": {
+       "type": "bestOf",
+       "count": 5
+      }
+     }
+    },
+    {
+     "startTime": "2026-10-16T18:00:00Z",
+     "state": "unstarted",
+     "type": "match",
+     "blockName": "Play-Ins",
+     "league": {
+      "name": "Worlds",
+      "slug": "worlds"
+     },
+     "match": {
+      "id": "115660588583171790",
+      "flags": [],
+      "teams": [
+       {
+        "name": "TBD",
+        "code": "TBD",
+        "image": "https://static.lolesports.com/teams/team-tbd.png",
+        "result": null,
+        "record": null
+       },
+       {
+        "name": "TBD",
+        "code": "TBD",
+        "image": "https://static.lolesports.com/teams/team-tbd.png",
+        "result": null,
+        "record": null
+       }
+      ],
+      "strategy": {
+       "type": "bestOf",
+       "count": 5
+      }
+     }
+    }
+   ]
+  }
+ }
+}

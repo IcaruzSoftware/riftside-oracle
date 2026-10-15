@@ -1,0 +1,125 @@
+{
+ "data": {
+  "event": {
+   "id": "113475871524050783",
+   "type": "match",
+   "tournament": {
+    "id": "113475452383887518"
+   },
+   "league": {
+    "id": "98767975604431411",
+    "slug": "worlds",
+    "image": "http://static.lolesports.com/leagues/1592594612171_WorldsDarkBG.png",
+    "name": "Worlds"
+   },
+   "match": {
+    "strategy": {
+     "count": 5
+    },
+    "teams": [
+     {
+      "id": "98767991853197861",
+      "name": "T1",
+      "code": "T1",
+      "image": "http://static.lolesports.com/teams/1726801573959_539px-T1_2019_full_allmode.png",
+      "result": {
+       "gameWins": 3
+      }
+     },
+     {
+      "id": "99566404579461230",
+      "name": "kt Rolster",
+      "code": "KT",
+      "image": "http://static.lolesports.com/teams/kt_darkbackground.png",
+      "result": {
+       "gameWins": 2
+      }
+     }
+    ],
+    "games": [
+     {
+      "number": 1,
+      "id": "113475871524050784",
+      "state": "completed",
+      "teams": [
+       {
+        "id": "98767991853197861",
+        "side": "blue"
+       },
+       {
+        "id": "99566404579461230",
+        "side": "red"
+       }
+      ],
+      "vods": []
+     },
+     {
+      "number": 2,
+      "id": "113475871524050785",
+      "state": "completed",
+      "teams": [
+       {
+        "id": "98767991853197861",
+        "side": "blue"
+       },
+       {
+        "id": "99566404579461230",
+        "side": "red"
+       }
+      ],
+      "vods": []
+     },
+     {
+      "number": 3,
+      "id": "113475871524050786",
+      "state": "completed",
+      "teams": [
+       {
+        "id": "99566404579461230",
+        "side": "blue"
+       },
+       {
+        "id": "98767991853197861",
+        "side": "red"
+       }
+      ],
+      "vods": []
+     },
+     {
+      "number": 4,
+      "id": "113475871524050787",
+      "state": "completed",
+      "teams": [
+       {
+        "id": "99566404579461230",
+        "side": "blue"
+       },
+       {
+        "id": "98767991853197861",
+        "side": "red"
+       }
+      ],
+      "vods": []
+     },
+     {
+      "number": 5,
+      "id": "113475871524050788",
+      "state": "completed",
+      "teams": [
+       {
+        "id": "98767991853197861",
+        "side": "blue"
+       },
+       {
+        "id": "99566404579461230",
+        "side": "red"
+       }
+      ],
+      "vods": []
+     }
+    ]
+   },
+   "streams": []
+  }
+ }
+}
