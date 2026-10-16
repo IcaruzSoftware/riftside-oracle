@@ -123,7 +123,7 @@ LEAGUE_PRIOR = {
 }
 INTERNATIONAL = {"WLDs", "MSI", "FST", "EWC", "MSC"}   # cross-region signal; K unchanged
 
-# Deviates from spec §5.2 ("zero-sum", "no seasonal regression in v1") on purpose:
+# Deviates from the plain zero-sum, no-seasonal-regression ELO on purpose (see docs/elo.md):
 # Outcome Elo refinements, chosen on the 2021-07..2025-05 walk-forward validation
 # (3 windows before the test slice; MAJOR series log loss -0.0043, 95% CI
 # [-0.0064, -0.0022], game log loss -0.0026 vs plain K=24; the new-year pull alone is

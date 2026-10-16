@@ -1,237 +1,270 @@
 # CLAUDE.md
 
-> **Fork in progress:** this is a fork of courtside-oracle being translated to League of Legends.
-> [RIFTSIDE_HANDOVER.md](RIFTSIDE_HANDOVER.md) is the spec and overrides the rest of this file where they conflict;
-> the sections below still describe the NBA original until Phase 6.
-> **Current status, decisions and next steps: [HANDOFF.md](HANDOFF.md). Read it first.**
+Entry point for an AI session working in this repo. Read this first, then
+**[HANDOFF.md](HANDOFF.md) for current status, decision log and open points**;
+this file links to `docs/` for depth instead of duplicating it. Human-facing
+overview: [README.md](README.md).
 
-Entry point for an AI session working in this repo. Read this first; it links
-to `docs/` for depth instead of duplicating it. Human-facing overview:
-[README.md](README.md).
+Forked from courtside-oracle (NBA).
+
+Working agreements:
+
+- The owner pushes and deploys; agents commit per phase/change.
+- Model choices are made on validation only; the test slice is looked at once
+  ([docs/model.md](docs/model.md#evaluation-protocol)).
 
 ## What this is
 
-Courtside Oracle predicts NBA game outcomes: a custom per-player ELO system
-feeds an XGBoost classifier (Platt-calibrated). Predictions run daily via
-GitHub Actions, are stored in Supabase, and are shown on a Next.js site
-(https://courtside-oracle.gerritvisser.de) and a 420×260 iframe widget
-embedded on https://gerritvisser.de (separate repo: `IcaruzSoftware/portfolio`).
+Riftside Oracle predicts professional League of Legends **series** (Bo1/Bo3/Bo5)
+before they start. A per-player ELO system (5 role-normalised performance skills
+plus an outcome ELO) feeds an XGBoost classifier (Platt-calibrated) that predicts
+one game, blue side vs red side; the series probability is derived from it.
+Predictions run daily via GitHub Actions, are stored in Supabase, and are shown
+on a Next.js site (`https://riftside-oracle.gerritvisser.de`, subdomain not yet
+confirmed) and a 420×260 iframe widget (`/card`) meant to be embedded on
+https://gerritvisser.de from `IcaruzSoftware/portfolio` (embed not set up yet;
+see HANDOFF.md).
+
+The public record counts **series**, not games.
 
 ## Data flow
 
 ```
-bootstrap (stats.nba.com, one-time) → elo.py → committed ELO state
-                                                       │
-daily: cdn.nba.com → daily_state.py → state files → elo.py (incremental)
-daily: cdn.nba.com → evaluate.py    → Supabase (resolve predictions, running_record)
-daily: cdn.nba.com → predict.py     → features.py (live) → xgb_model.pkl → Supabase
-                                                       │
-                        Supabase (RLS) → web/ (Next.js static export) → manual build+upload → Plesk/nginx
+bootstrap (Oracle's Elixir yearly CSVs, Drive) → elo.py → committed ELO state
+                                                    │
+daily: OE current-year CSV → daily_state.py → team_games_*.csv + elo.update_elo (incremental)
+daily: lolesports getEventDetails → evaluate.py → Supabase (resolve predictions, running_record)
+daily: lolesports getSchedule → predict.py → features.py (live) → xgb_model.pkl → Supabase
+                                                    │
+        Supabase (RLS) → web/ (Next.js static export) → manual build+upload → Plesk/nginx
 ```
 
-Details: [docs/architecture.md](docs/architecture.md) (module-by-module +
-why the live and training feature paths differ),
-[docs/data.md](docs/data.md) (every file/table),
-[docs/elo.md](docs/elo.md) (the ELO system),
-[docs/model.md](docs/model.md) (features, training, metrics, caveats),
-[docs/operations.md](docs/operations.md) (runbook).
+Training and live use the same OE data shape and the same `features.py`
+functions. Details: [docs/architecture.md](docs/architecture.md) (module by
+module), [docs/data.md](docs/data.md) (every file/table),
+[docs/elo.md](docs/elo.md), [docs/model.md](docs/model.md) (features, training,
+metrics, caveats), [docs/operations.md](docs/operations.md) (runbook).
 
 ## Repo map
 
 ```
 src/pipeline/
-  collect.py          full nba_api collector (proxy-pool aware) — superseded by bootstrap_data.py for the actual rebuild
-  elo.py              player ELO: scoring, ranking, build_elo/update_elo/update_team_assignments, CDN adapter
-  nba_cdn.py          cdn.nba.com client: schedule, box score, game-ID prefix helpers, team id<->tricode
-  daily_state.py      daily catch-up: CDN box scores -> game logs/player stats/ELO (replaces removed update_season.py)
-  features.py         build_feature_matrix() — training and live feature paths
-  build_dataset.py    walks history -> feature_matrix.parquet (training input)
-  train.py            Optuna + XGBoost + Platt calibration -> models/xgb_model.pkl
-  predict.py          predict one matchup (CLI) or predict_todays_games() (daily pipeline)
-  evaluate.py         resolve pending predictions vs CDN results, recompute running_record
-  seed_finals.py      one-time historical seed — already run, do not re-run
-  shap_export.py      global SHAP plot/summary utility — not wired into the daily pipeline
+  oe.py               Oracle's Elixir: resolve file ids from the Drive folder, download, load/normalise, player/team rows, --check
+  lolesports.py       lolesports API: leagues, schedule, event details, resolve_team (aliases + normalised name), --check
+  team_aliases.csv    manual lolesports code/name -> OE teamid overrides (tracked source, not state)
+  elo.py              player ELO: 5 skill ELOs + outcome ELO, build_elo / update_elo, role norms
+  daily_state.py      daily catch-up: OE rows -> team_games_*.csv + incremental ELO (--init writes team_games once; refuses if they exist)
+  features.py         build_feature_matrix() (training and live), series_win_prob()
+  build_dataset.py    walks OE history -> feature_matrix.parquet (training input)
+  train.py            Optuna + XGBoost + Platt calibration -> models/xgb_model.pkl, baselines + gate
+  predict.py          predict one match / ad-hoc series (CLI) or predict_upcoming() (daily pipeline)
+  evaluate.py         resolve pending predictions via lolesports, recompute running_record
 src/scripts/
-  bootstrap_data.py   resumable stats.nba.com downloader for the historical rebuild
+  bootstrap_data.py   download every OE year file into src/data/raw/oe/
   daily_run.py        GitHub Actions entry point: --predict / --evaluate / both
 src/supabase/
-  schema.sql            fresh-setup schema (tables + RLS), run once in the SQL editor
-  migrations/001_*.sql  brings a pre-existing DB up to schema.sql's shape (game_time_utc + RLS)
+  schema.sql          tables (predictions, shap_values, running_record), RLS, explicit GRANTs; run once in the SQL editor
 .github/workflows/
-  daily_predict.yml   runs after daily_evaluate.yml completes — predict today's games
-  daily_evaluate.yml  3:00 AM ET — resolve results + advance committed state
+  daily_evaluate.yml  07:45 UTC — resolve results + advance committed state
+  daily_predict.yml   after Daily Evaluate (any conclusion) + crons 03:00 and 15:00 UTC — predict the next 36h
   keepalive.yml       daily — ping Supabase, re-enable workflows GitHub auto-disabled
-web/                  Next.js 15, static export; manual build+upload to the owner's Plesk server (no auto-deploy); app/(main)/ = site, app/card/ = iframe widget
-tests/                pytest; conftest.py has a FakeSupabase + a tiny built-from-fixture live state
+  check_sources.yml   manual — check OE and lolesports reachability from a runner
+web/                  Next.js 15, static export; manual build+upload to the owner's Plesk server (no auto-deploy); app/(main)/ = site (+ /demo), app/card/ = iframe widget
+tests/                pytest; conftest.py has a FakeSupabase; fixtures/ holds trimmed OE CSV and lolesports JSON
 ```
 
 ## Running locally
 
-Python **3.12** (matches CI; use a local `.venv` — it's gitignored, not committed).
+Python **3.12** (matches CI; the pins don't install on 3.13+). Use a local
+`.venv` — it's gitignored.
 
 ```bash
-pip install -r requirements.txt
-python -m pytest                                          # tests/, via pytest.ini
-python src/scripts/daily_run.py                            # evaluate + predict, today (ET)
-python src/scripts/daily_run.py --predict --dry-run --date 2026-06-13
+pip install -r requirements.txt pytest                    # pytest is not in requirements.txt
+python -m pytest                                           # 91 tests, via pytest.ini
+python src/scripts/daily_run.py                             # evaluate + state update + predict (UTC date)
+python src/scripts/daily_run.py --predict --dry-run         # print predictions, write nothing
 python src/scripts/daily_run.py --evaluate --dry-run
 python src/pipeline/daily_state.py --dry-run --date 2026-11-05
 python src/pipeline/evaluate.py --dry-run
-python src/pipeline/predict.py --game-id 0042500237
-python src/pipeline/predict.py --home NYK --away OKC --date 2026-06-05
-python src/pipeline/elo.py --force                          # full ELO rebuild from src/data/raw/
+python src/pipeline/predict.py --match-id 115660588583171786
+python src/pipeline/predict.py --team1 "Gen.G Esports" --team2 T1 --bo 5 [--league lck]
+python src/pipeline/oe.py --check                           # OE folder listing + real download test
+python src/pipeline/lolesports.py --check
+python src/scripts/bootstrap_data.py                        # download all OE year files (see Data access)
+python src/pipeline/elo.py --force                          # full ELO rebuild from src/data/raw/oe/
+python src/pipeline/daily_state.py --init                   # team_games_*.csv from the same OE files (delete the existing ones first)
 python src/pipeline/build_dataset.py --force                # rebuild feature_matrix.parquet
-python src/pipeline/train.py --trials 100 --force            # retrain
-python src/scripts/bootstrap_data.py --phase 2 --limit 3      # smoke-test the box-score downloader
+python src/pipeline/train.py --trials 100 --force           # retrain
 ```
 
 `SUPABASE_URL` / `SUPABASE_KEY` (service-role key) are required for anything
-that isn't `--dry-run`. `web/`: `cd web && npm install && npm run dev`.
+that isn't `--dry-run`. Without the raw OE files (gitignored) the tests and
+live predictions still work from the committed state; rebuilding ELO or
+retraining needs them. `web/`: `cd web && npm install && npm run dev`
+(`/demo` shows labelled mock rows; `?demo=1` on any page does too, but only under `npm run dev`).
 
 ## Committed live-state contract
 
 `.gitignore` ignores `src/data/raw/*` and `src/data/processed/*` wholesale,
-then re-includes exactly four files with `!` negations — **never commit
-anything else under `src/data/`,** and never add a new generated file there
-without also adding its negation:
+then re-includes exactly these with `!` negations — **never commit anything
+else under `src/data/`,** and never add a new generated file there without
+also adding its negation:
 
-- `src/data/raw/game_log_*.csv` — one row per team per game (appended daily by `daily_state.py`)
-- `src/data/raw/player_season_stats_*.csv` — one row per player per season (updated daily)
+- `src/data/raw/team_games_*.csv` — one row per team per game, one file per year (appended daily by `daily_state.py`; don't hand-edit)
 - `src/data/processed/player_elo_current.parquet` — post-game ELO snapshot per player
-- `src/data/processed/player_elo_recent.parquet` — last-11 pre-game ELO snapshots per player
+- `src/data/processed/player_elo_recent.parquet` — last 11 pre-game snapshots per player (committed in full, no pruning)
+- `src/data/processed/role_norms.json` — role normalisation means/stds over 2022–2025; frozen for incremental updates, recomputed by every `elo.py --force`
 
-`src/models/xgb_model.pkl` **is committed** (its own negation in
-`.gitignore`) — the old "model not committed" caveat from an earlier README
-is no longer true. `player_elo.parquet` (full history) and
-`feature_matrix.parquet` are deliberately **not** committed — see
-[docs/data.md](docs/data.md) for the full file-by-file table and why.
+`src/models/xgb_model.pkl` is committed (its own negation). Not committed:
+the OE raw CSVs (`src/data/raw/oe/`, ~856 MB), `player_elo.parquet` (full
+history) and `feature_matrix.parquet`. File-by-file table:
+[docs/data.md](docs/data.md).
 
-## NBA data access rules
+## Data access rules
 
-Two unrelated sources, never mixed in one run:
-
-- **stats.nba.com** (via `nba_api`) — bootstrap only. Works from the owner's
-  home PC with `nba_api`'s default browser-like headers; **times out from
-  GitHub-hosted runners** (confirmed), so the full rebuild is a local/overnight
-  job, never CI.
-- **cdn.nba.com** (via `src/pipeline/nba_cdn.py`) — the entire daily pipeline.
-  Needs the browser-style JSON header set in `nba_cdn.CDN_HEADERS` (modern UA,
-  `Origin`/`Referer` `https://www.nba.com`, `Sec-Fetch-*`) — a plain request,
-  and even `nba_api`'s own (outdated) live header set, gets an Akamai 403.
-  **Confirmed: cdn.nba.com returns 403 from GitHub-hosted runners even with
-  `CDN_HEADERS`** (NBA blacklists cloud IP ranges), while it works direct from a
-  home PC. So the daily jobs route the CDN calls through static residential
-  proxies configured in the `NBA_PROXIES` secret (comma-separated
-  `http(s)://user:pass@host:port`; URL-encode special characters in the password
-  or urllib3 fails to parse it). Unset/empty → direct connection (local dev,
-  unchanged). `nba_cdn` fails over across the proxies in order, sticky to the
-  last one that worked, and on all-fail raises a summary that names each
-  `host:port` but never credentials. Box scores exist from the 2019-20 season
-  onward. `fetch_boxscore()` treats a 404 as normal (game not played yet →
-  `None`) and a 403 as an IP block (failover trigger, loud on total failure,
-  never silently skipped). Verify proxy reachability with
-  `python src/pipeline/nba_cdn.py --check` (or the manual `check_nba_proxies.yml`
-  workflow) — see [docs/operations.md](docs/operations.md).
+- **Oracle's Elixir (OE)** — the only stats source, for history *and* the
+  daily job. One CSV per year in a public Google Drive folder (id in
+  `oe.FOLDER_ID`); `oe.py` resolves file ids by parsing the embedded folder
+  view, so a new year's file needs no code change. OE refreshes about 07:05
+  UTC and lags about a day; the current-year file is ~78 MB. Local files
+  younger than 20 h are reused.
+- **Drive quota:** on 2026-10-15 every scripted full download got Drive's
+  "Quota exceeded" page. Do **not** chunk around it with Range requests. A
+  blocked download makes the state update fail loudly (the run exits 1), but
+  evaluate and predict still run on the committed state, and the next day's
+  run catches up through `LOOKBACK_DAYS = 14`. For a local rebuild, download
+  the files by hand from the Drive folder into `src/data/raw/oe/`, keeping
+  the original names (`2026_LoL_esports_match_data_from_OraclesElixir.csv`).
+- **lolesports API** (`esports-api.lolesports.com`) — schedule and results.
+  Unofficial, so every call fails loudly. Uses the public key the site itself
+  sends (`lolesports.API_KEY`, not a secret). Both sources work from GitHub
+  runners; **no proxy is needed** (`check_sources.yml` passed).
+- Not used on purpose: the Riot developer API (solo queue only) and
+  Leaguepedia Cargo (rate-limited).
 
 ## Invariants / gotchas
 
-- Game-ID prefix encodes type: `001` preseason, `002` regular season, `003`
-  all-star, `004` playoffs, `005` play-in, `006` Cup final. Only
-  `{002,004,005,006}` are "stateful" (`nba_cdn.is_stateful`) — update ELO and
-  get predicted. All-star games are ignored entirely; preseason only updates
-  a player's team assignment (never ELO), and only if the new appearance is
-  newer than what's on file.
-- `daily_state.py` rescans from **7 days before the last logged game**
-  through the target date, not just the target date — so a box score that
-  wasn't available yet on its game day still gets picked up later. Idempotent
-  either way: games already in the game logs / ELO state are skipped.
-- `predict.py` only predicts games that haven't started yet and never
-  overwrites a prediction that already has a result — a late/partial re-run
-  can't clobber a resolved pick.
-- `evaluate.py` recomputes `running_record` on every run (not only when a
-  prediction was just resolved), and the state update in `daily_run.py
-  --evaluate` still runs even if `evaluate()` itself raised.
-- `RECORD_START` (`evaluate.py`, currently `"2026-10-01"`) is the only thing
-  keeping the 5 retroactive `seed_finals.py` rows out of the public running
-  record. Don't re-run `seed_finals.py`.
-- MATCHUP string (`"XXX vs. YYY"` = home, `"XXX @ YYY"` = away) is the only
-  home/away signal in the game logs — there's no dedicated column.
-- The **committed model** was trained on the original dataset (`collect.py`,
-  which does fetch `boxscore_summary_*.json`), so it learned real
-  availability effects. The *re-downloaded* bootstrap dataset (`bootstrap_data.py`)
-  does **not** fetch `boxscore_summary` — only if/when someone retrains on
-  that data would availability features go neutral for training too (fix:
-  add `"summary"` to `bootstrap_data.py`'s wanted endpoints and re-run phase 2
-  for it before retraining, ~14k extra calls ≈ 2.5h). See [docs/data.md](docs/data.md).
-- `scikit-learn==1.8.0` is pinned because `xgb_model.pkl` was pickled with
-  it — don't bump it without retraining.
+- `daily_state.py` ingests only games dated strictly **before** the target
+  day (UTC); same-day games wait for the next run, so the ELO state never
+  holds day d while live features cut `team_games` at day < d. It rescans
+  from 14 days before the last logged game, so late OE rows still arrive.
+- Only gameids **new to `team_games`** reach `elo.update_elo`, and the ELO
+  update runs before the CSV append (a failed append is retried safely:
+  `update_elo` skips games it already holds). Incomplete games (not 12 rows,
+  5 roles per side, results present) are skipped and picked up later.
+- `update_elo` applies late OE rows in **arrival order**, not date order; a
+  full rebuild re-sorts. Incremental over in-order games equals a full build.
+- Point-in-time is day-level: a game on day d sees only `team_games` rows
+  from before d and ELO as of the start of d.
+- `predict.py` only predicts unstarted matches inside the 36 h window,
+  skips `TBD` and unresolved teams (logs a warning), and **never overwrites a
+  row that has `actual_winner`**. Unstarted rows are refreshed.
+- `evaluate.py` isolates each match (one failing lookup doesn't stop the
+  others; it raises once at the end), counts an unknown match id as
+  unresolved, and **recomputes `running_record` on every run**. Forfeits
+  (0-0) never resolve; they only get the 7-day warning.
+- `daily_run.py` attempts every step (evaluate, state update, predict) even
+  if an earlier one failed, and exits non-zero if any did.
+- `RECORD_START` (`evaluate.py`, currently `"2026-10-15"`) is the first match
+  date counted in the public running record.
+- `role_norms.json` is **frozen** for incremental updates: never recompute it
+  there or they stop matching a rebuild. Every `elo.py --force` **recomputes**
+  it, which changes the ELO state, so a retrain follows.
+- `scikit-learn==1.8.0` and `xgboost==3.2.0` match the pickled
+  `xgb_model.pkl`; don't bump either without retraining.
+- Players with a missing `playerid` are skipped in the ELO (the rest of the
+  game is processed). Never use `playername` as a key.
+- Team aliases: lolesports and OE share no team id. `resolve_team` checks
+  `team_aliases.csv` first, then an exact normalised-name match against
+  recent OE teams — never fuzzy. A sponsor rename shows up as
+  `WARNING unmapped team` and a skipped match.
+- Playoffs context in live mode comes from the lolesports `blockName`
+  (domestic leagues only); OE flags it differently in a few leagues.
 
 ## Where external things live
 
-- **Supabase** project `pxvimjflsishbfrublwp` (free tier; pauses after ~7
+- **Supabase** project `pdblqlbgrelyqjgkpdte` (free tier; pauses after ~7
   days idle, kept awake by `keepalive.yml`). Service-role key in GitHub
-  secrets (`SUPABASE_KEY`); anon key goes into `web/.env.local`
-  (`NEXT_PUBLIC_SUPABASE_ANON_KEY`) at build time — never the same key in
-  both places.
-- **NBA proxies**: GitHub secret `NBA_PROXIES` (comma-separated
-  `http(s)://user:pass@host:port`, 1–3 static residential proxies) routes the
-  daily CDN calls past NBA's cloud-IP block. Passed to `daily_predict.yml`,
-  `daily_evaluate.yml`, and `check_nba_proxies.yml`. The old `PROXIES` secret
-  (nba_api proxy-pool, bootstrap only) is obsolete and unused by the pipeline.
-- **The owner's Plesk server** (nginx; `courtside-oracle.gerritvisser.de` and
-  `gerritvisser.de` both resolve to it) serves the static export. No
-  auto-deploy — see [docs/operations.md](docs/operations.md#deploying-the-web-app)
-  for the manual build + upload procedure. The CSP `frame-ancestors` header
-  that lets `/card` be iframed on `gerritvisser.de` is set in the server
-  config, not by the Next.js app (a static export can't set response headers
-  itself).
-- **Portfolio embed**: `/card` is iframed from `IcaruzSoftware/portfolio` — a
-  breaking change to its markup/query needs a check in that repo too.
+  secrets (`SUPABASE_URL`, `SUPABASE_KEY`); the anon key goes into
+  `web/.env.local` (`NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY`)
+  at build time — **never the same key in both places**. Newer Supabase
+  projects grant no table privileges by default, so `schema.sql` ends with
+  explicit GRANTs.
+- **The owner's Plesk server** (nginx) is meant to serve the static export (not
+  deployed yet). No auto-deploy — see
+  [docs/operations.md](docs/operations.md#deploying-the-web-app). For `/card`
+  to be iframed on `gerritvisser.de`, the CSP `frame-ancestors` header must be
+  set in the server config when deploying (not by the Next.js app).
+- **Portfolio embed**: `/card` is meant to be iframed from
+  `IcaruzSoftware/portfolio` (owner step, see HANDOFF.md). Don't break the
+  card's markup or query interface; check that repo for any breaking change.
 - **GitHub Actions**: public repo, so GitHub auto-disables scheduled
-  workflows after 60 days with no repo activity; `keepalive.yml` re-enables
-  all three daily via `gh workflow enable` on every run.
+  workflows after 60 days of no repo activity; `keepalive.yml` re-enables the
+  two daily workflows (and itself) via `gh workflow enable` on every run. Bot identity:
+  `riftside-oracle[bot]`.
 
 ## Known limitations
 
-- No live injury feed — player-availability features are always neutral for
-  live predictions. This is a genuine train/serve mismatch: the **committed
-  model** trained on real availability data (see above), so live predictions
-  are missing a signal the model actually learned to use.
-- Live ELO updates (CDN box score) lack `defensiveRating` and tracking data:
-  defense degrades to steals+blocks only, and hustle ELO freezes for every
-  post-bootstrap game. Historical/bootstrap ELO is unaffected.
-- Training features are more optimistic than live: training ELO rosters are
-  each game's actual ≥10-minute participants, live rosters are approximated
-  from the ELO state; training PPG/star-out weights use the full final
-  season, live uses season-to-date only. Expect live accuracy below the
-  67.5% backtest. Full breakdown: [docs/model.md](docs/model.md).
-- `web/app/(main)/page.tsx` hardcodes the model metrics text (67.5%/0.729/
-  0.209/0.606) — it does not read `model_metadata` (which nothing writes to
-  anyway).
-- Head-to-head and home/away-split features use all games since 2015-16, not
-  just the current season — consistent between training and live, just worth
-  knowing when reading a small early-season sample.
+- **Pre-draft only.** Picks and bans are unknown before the match and swing
+  games; the model can't see them. ~70% series accuracy is about the ceiling
+  with this data.
+- Cross-region strength rests on international games (a few hundred per
+  year), player transfers and hand-set league priors (`elo.LEAGUE_PRIOR`).
+- Small samples and roster churn: early-season predictions (Nov–Jan
+  off-season changes) are the weakest.
+- Live roster = the team's last-known starters; same-day substitutions are
+  invisible. Training uses the actual lineups.
+- OE lags about a day: a team playing on consecutive days is predicted
+  without yesterday's game. LPL rows can lag more and lack early-game stats.
+- The lolesports API is unofficial and can change without notice.
+- Series maths assumes independent games (no momentum, no side alternation).
+  In major-league Bo5s the series probabilities are slightly worse
+  calibrated than plain ELO's.
+- `web/app/(main)/page.tsx` hardcodes the model metrics text; it does not
+  read them from anywhere.
+- More small items and the accepted Phase 4 limitations:
+  [HANDOFF.md](HANDOFF.md) (open points).
+
+## Web rules
+
+The site follows Riot's fan-project rules: keep the Riot disclaimer and the
+"Match data: Oracle's Elixir and lolesports" credit in the footer, and add
+**no betting language, odds or affiliate links** anywhere.
 
 ## Common changes
 
-- **Change a job's schedule** — edit the `cron:` line in the relevant
-  `.github/workflows/*.yml` (times are UTC; comments note the ET equivalent).
-  `daily_predict.yml` has no cron of its own — it follows `daily_evaluate.yml`
-  via `workflow_run`.
+- **Add a team alias** — add a row to `src/pipeline/team_aliases.csv`
+  (`lolesports_code,lolesports_name,oe_teamid`; find the id in
+  `team_games_*.csv`). Check with `predict.py --dry-run`.
 - **Add a feature** — add a `get_*_features()` function in `features.py`,
-  wire it into `build_feature_matrix()` (both training and live call the same
-  function unless it needs `use_current_elo` branching), then **you must
-  retrain**: `build_dataset.py --force` → `train.py --force`, and commit the
-  new `models/xgb_model.pkl`. A live-only feature with no training equivalent
-  will silently read as `0.0` in training and vice versa.
-- **Apply a Supabase migration** — SQL editor, see
+  wire it into `build_feature_matrix()` (training and live call the same
+  function), then **you must retrain**, in this order: `elo.py --force` →
+  (if committing the ELO state: delete `team_games_*.csv`, then
+  `daily_state.py --init` from the same OE files) → `build_dataset.py --force`
+  → `train.py --trials 100 --force`. Always rebuild the ELO before
+  `build_dataset`: it reads the uncommitted `player_elo.parquet`, and a stale
+  one silently falls back to the current ELO for later games (look-ahead).
+  Commit the ELO state only together with a fresh `--init`, otherwise
+  `team_games` desyncs from the ELO and the missing games are never picked up
+  (`daily_state` only passes gameids new to `team_games`). Commit the new
+  `models/xgb_model.pkl`. A live-only feature with no training equivalent
+  is never a training column (so the model ignores it), and a training-only
+  feature reads as missing (NaN) live. If a retrain moves the
+  pins, update `requirements.txt` too.
+  After a retrain, update the hardcoded results in `web/app/(main)/page.tsx`,
+  README.md, docs/model.md (Results) and the HANDOFF.md model numbers. For a
+  new feature also extend `FEATURE_LABELS` in `web/components/GameCard.tsx`.
+- **Change a job's schedule** — edit the `cron:` line in the relevant
+  `.github/workflows/*.yml` (times are UTC). `daily_predict.yml` also follows
+  `daily_evaluate.yml` via `workflow_run`.
+- **Change the predicted leagues** — `PREDICT_LEAGUES` and `OE_LEAGUE` in
+  `predict.py`.
+- **Apply schema changes** — SQL editor, see
   [docs/operations.md](docs/operations.md#applying-a-supabase-migration).
-  `001` must land before deploying any web build that queries
-  `game_time_utc`.
 - **Deploy the web app** — not push-to-deploy: `cd web && npm run build`
   (with `web/.env.local` set), then manually upload `web/out/`'s contents to
   the subdomain on the Plesk server — see
   [docs/operations.md](docs/operations.md#deploying-the-web-app).
 - **Rebuild ELO / bootstrap from scratch** — see
-  [docs/operations.md](docs/operations.md#full-historical-bootstrap--elo-rebuild)
-  (~7h unattended); commit only the state files listed above, never raw data.
+  [docs/operations.md](docs/operations.md#full-historical-bootstrap--elo-rebuild);
+  commit only the state files listed above, never raw data.

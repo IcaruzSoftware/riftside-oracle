@@ -1,251 +1,349 @@
 # Operations runbook
 
-## Background
+## Local setup
 
-The original build PC was reset and `src/data/raw/` / the ELO parquet state
-were never committed — the pre-fix `.gitignore` ignored the `data/` dirs
-wholesale, and git cannot re-include a file whose parent directory is itself
-ignored, so the `!` negations for the state files silently did nothing. The
-historical data was re-downloaded from scratch with `src/scripts/bootstrap_data.py`
-(2015-16..2025-26, 14,128 games, traditional/advanced/tracking box scores) and
-the ELO rebuilt. The fixed `.gitignore` now ignores `src/data/raw/*` and
-`src/data/processed/*` but whitelists the state files listed in
-[data.md](data.md), so this shouldn't recur — but if `git status` ever shows
-none of the state files tracked after a fresh clone, that's the symptom to
-check for.
+Python **3.12** is required (the pinned scientific stack does not install on
+3.13+; CI uses 3.12).
 
-## The three GitHub Actions workflows
+```bash
+git clone https://github.com/IcaruzSoftware/riftside-oracle.git && cd riftside-oracle
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements.txt pytest
+.venv/bin/python -m pytest
+```
 
-All three live in `.github/workflows/` and run on `ubuntu-latest` with Python
-3.12 (matches the local `.venv`).
+**Windows notes** (from the 2026-10-15 PC):
 
-### `daily_predict.yml` — Daily Predictions
+- If `uv` is not installed, create the venv with the launcher:
+  `py -3.12 -m venv .venv`, then
+  `.venv\Scripts\python -m pip install -r requirements.txt pytest`.
+- If Windows Application Control blocks pyarrow 26, install
+  `pip install pyarrow==21.0.0` into the venv by hand. `requirements.txt` stays
+  unchanged (`pyarrow>=15.0.0`) and CI is unaffected.
 
-- **Trigger:** `workflow_run` on `daily_evaluate.yml` completing (any
-  conclusion), not its own cron — so it always runs right after evaluate
-  commits fresh state, regardless of scheduler delay. Also `workflow_dispatch`
-  (manual trigger from the Actions tab).
-- **Runs:** `python src/scripts/daily_run.py --predict`.
-- **Commits nothing.** Only writes to Supabase (`predictions`, `shap_values`)
-  via `SUPABASE_URL` / `SUPABASE_KEY`.
+The committed state ([data.md](data.md#committed-live-state)) is enough to run
+the tests and live predictions. **The raw OE data is not in git** (13 CSVs,
+~856 MB, gitignored). To rebuild history or retrain, download the files by
+hand from the Drive folder
+<https://drive.google.com/drive/folders/1gLSw0RLjBbtaNy0dgnGQDAZOHIgCe-HH>
+into `src/data/raw/oe/`, keeping the original names (for example
+`2026_LoL_esports_match_data_from_OraclesElixir.csv`). `bootstrap_data.py`
+does the same, but Drive often blocks scripted full downloads (see
+[Drive quota](#when-a-job-fails)).
 
-### `daily_evaluate.yml` — Daily Evaluate
+## Manual commands
 
-- **Schedule:** `0 7 * * *` (07:00 UTC = 3:00 AM ET, 2:00 AM in winter/EST,
-  after West Coast games are final). Also `workflow_dispatch`.
-- **Runs:** `python src/scripts/daily_run.py --evaluate`, which runs two
-  independent steps, each in its own try/except: first `evaluate.py` (resolve
-  pending predictions, recompute `running_record`), then `daily_state.run()`
-  (advance the committed game logs / player stats / ELO state from the CDN).
-  A failure in the first does not skip the second — either failing still
-  fails the job (non-zero exit) so the workflow shows red.
-- **Commits:** `git add src/data/` then commits + pushes only if that stages
-  a diff (`git diff --cached --quiet` gate). Since `.gitignore` only allows
-  the whitelisted state files under `src/data/`, this can only ever commit
-  `game_log_*.csv`, `player_season_stats_*.csv`, `player_elo_current.parquet`,
-  and `player_elo_recent.parquet` — never raw box scores. Commit message:
-  `chore: daily state update [skip ci]`. Needs `permissions: contents: write`
-  (already set).
+```bash
+python -m pytest                                              # tests/, via pytest.ini
+python src/scripts/daily_run.py                               # evaluate + state update + predict
+python src/scripts/daily_run.py --predict --dry-run --date 2026-10-16
+python src/scripts/daily_run.py --evaluate --dry-run
+python src/pipeline/daily_state.py --dry-run --date 2026-11-05
+python src/pipeline/evaluate.py --dry-run
+python src/pipeline/predict.py --dry-run                      # next 36h of PREDICT_LEAGUES matches
+python src/pipeline/predict.py --match-id 115660588583171786  # one lolesports match
+python src/pipeline/predict.py --team1 "Gen.G Esports" --team2 T1 --bo 5 --league lck
+python src/pipeline/oe.py --check
+python src/pipeline/lolesports.py --check
+```
 
-### `keepalive.yml` — Keepalive
+`SUPABASE_URL` / `SUPABASE_KEY` (service-role key) are required for anything
+that is not `--dry-run`. `--date` is a UTC date (`YYYY-MM-DD`); for
+`daily_state.py` it is the target day, and only games dated **before** it are
+ingested. Ad-hoc `predict.py` takes team **names** as on lolesports or OE.
 
-- **Schedule:** `17 6 * * *` (06:17 UTC, off the hour on purpose).
-  Also `workflow_dispatch`.
-- **Purpose 1:** Supabase free-tier projects auto-pause after ~7 days with no
-  activity. A `curl -f` authenticated read against `running_record` keeps the
-  project awake and fails the job loudly if Supabase is unreachable/paused.
+## The four GitHub Actions workflows
+
+All live in `.github/workflows/` and run on `ubuntu-latest` with Python 3.12.
+Matches run around the clock (LCK/LPL roughly 08:00 to 15:00 UTC, LEC 16:00 to
+21:00, LCS/CBLOL 20:00 to 03:00) and OE refreshes around 07:05 UTC, which
+drives the schedule. GitHub often starts scheduled runs late; that is fine
+here.
+
+| Workflow | Trigger (UTC) | Runs | Commits |
+|---|---|---|---|
+| `daily_evaluate.yml` | cron `45 7 * * *`, `workflow_dispatch` | `daily_run.py --evaluate` | state files |
+| `daily_predict.yml` | `workflow_run` after Daily Evaluate (any conclusion), crons `0 3 * * *` and `0 15 * * *`, `workflow_dispatch` | `daily_run.py --predict` | nothing |
+| `keepalive.yml` | cron `17 6 * * *`, `workflow_dispatch` | Supabase ping + `gh workflow enable` | nothing |
+| `check_sources.yml` | `workflow_dispatch` only | `oe.py --check`, `lolesports.py --check` | nothing |
+
+### `daily_evaluate.yml`: Daily Evaluate
+
+Runs at 07:45 UTC, after the OE refresh. `daily_run.py --evaluate` runs two
+independent steps, each in its own try/except:
+
+1. `evaluate.py`: resolve started predictions without a result via lolesports
+   `getEventDetails`, then recompute `running_record`.
+2. `daily_state.run()`: download the current OE year file, ingest new games
+   into `team_games_{year}.csv` and the ELO state.
+
+A failure in the first does not skip the second; either failing makes the job
+exit non-zero so the run shows red.
+
+The commit step runs **even if the previous step failed** (if only evaluate
+failed, the state update still succeeded and must be committed). It does
+`git add src/data/`, which can only stage the whitelisted state files:
+`team_games_*.csv`, `player_elo_current.parquet`, `player_elo_recent.parquet`
+and `role_norms.json` (frozen, so it normally does not change). If something
+is staged it commits `chore: daily state update [skip ci]` as
+`riftside-oracle[bot]`, runs `git pull --rebase origin <branch>`, and pushes.
+Needs `permissions: contents: write`, which the workflow declares.
+
+### `daily_predict.yml`: Daily Predictions
+
+- `workflow_run` on Daily Evaluate completing with **any** conclusion, so a
+  failed evaluate (for example a blocked OE download) still predicts, on the
+  committed state. It checks out `main` explicitly, because a `workflow_run`
+  checkout can otherwise be the SHA from before evaluate's state commit.
+- Cron `0 3 * * *` is a safety net for early-UTC matches if evaluate runs late
+  (it uses yesterday's state). Cron `0 15 * * *` picks up bracket matches
+  whose `TBD` teams resolved during the day.
+- `predict_upcoming()` covers every unstarted `PREDICT_LEAGUES` match in the
+  next 36 hours. It upserts on `match_id`, refreshes rows of unstarted matches,
+  and never touches a row that already has `actual_winner`. Commits nothing;
+  only writes to Supabase (`predictions`, `shap_values`).
+- LCK/LPL matches between about 05:00 and 09:00 UTC are predicted on state
+  that is missing the previous day, because OE refreshes around 07:05 UTC.
+  This is by design.
+
+### `keepalive.yml`: Keepalive
+
+- **Purpose 1:** Supabase free-tier projects auto-pause after about 7 days
+  without activity. A `curl -f` authenticated read of `running_record` keeps
+  the project awake and fails the job if Supabase is unreachable or paused.
 - **Purpose 2:** GitHub disables scheduled workflows in public repos after 60
-  days with no repository activity (this already happened to both
-  `daily_*.yml` once, in August 2026). The second step runs
-  `gh workflow enable daily_evaluate.yml / daily_predict.yml / keepalive.yml`
-  on every run (`if: always()`, so it still re-enables the workflows even if
-  the Supabase ping above failed), keeping all three schedules alive
-  indefinitely. Needs `permissions: actions: write`.
-- **The daily CDN calls go through residential proxies** (`NBA_PROXIES`
-  secret): cdn.nba.com returns 403 from GitHub-hosted runners (NBA blacklists
-  cloud IP ranges), so direct access only works locally. See the "NBA CDN
-  block / 403" entry under "When a job fails" below.
+  days without repository activity. The second step runs
+  `gh workflow enable` for `daily_evaluate.yml`, `daily_predict.yml` and
+  `keepalive.yml` on every run (`if: always()`, so it still runs when the ping
+  failed). Needs `permissions: actions: write`.
+
+### `check_sources.yml`: Check Data Sources
+
+Manual. Runs `oe.py --check` and `lolesports.py --check` from a GitHub runner
+(the second even if the first fails). It passed once on a runner, so neither
+source needs a proxy. Run it again when a daily run suddenly cannot reach
+either source.
 
 ## Required GitHub secrets
 
 | Secret | Used by | Notes |
 |---|---|---|
-| `SUPABASE_URL` | `daily_predict.yml`, `daily_evaluate.yml`, `keepalive.yml` | Public project URL, safe to also keep in local `.env` |
-| `SUPABASE_KEY` | same | **Service-role key** — bypasses RLS, full read/write. Never expose this to the web app (see `web`'s `NEXT_PUBLIC_SUPABASE_ANON_KEY`, which is a different, RLS-restricted key baked in at build time via `web/.env.local` — not a GitHub secret, see "Deploying the web app" below) |
-| `NBA_PROXIES` | `daily_predict.yml`, `daily_evaluate.yml`, `check_nba_proxies.yml` | 1–3 static residential proxies, comma-separated `http(s)://user:pass@host:port`. URL-encode special characters in the password (e.g. `@`→`%40`) or urllib3 fails to parse it. Unset/empty → direct connection (local dev). Required in CI (see below). |
+| `SUPABASE_URL` | `daily_predict.yml`, `daily_evaluate.yml`, `keepalive.yml` | Public project URL (`https://pdblqlbgrelyqjgkpdte.supabase.co`). |
+| `SUPABASE_KEY` | same | **Service-role key**: bypasses RLS, full read/write. Never put it in the web app. The web app uses the separate, RLS-restricted anon key via `web/.env.local` (not a GitHub secret; see [Deploying the web app](#deploying-the-web-app)). |
 
-`PROXIES` (singular, no `NBA_` prefix) is **obsolete** — it was only ever read
-by `collect.py`'s proxy pool, which nothing in the current daily pipeline uses.
-Safe to delete from repo secrets. The pipeline's proxy support is the separate
-`NBA_PROXIES` secret above (CDN failover), not `PROXIES`.
+There is no proxy secret: neither OE nor lolesports blocks GitHub runners.
 
 ## When a job fails
 
-Check the failed run's logs in the Actions tab first — every pipeline script
+Check the failed run's logs in the Actions tab first; every pipeline script
 logs at `INFO` level with timestamps. Common causes:
 
-- **Supabase paused / unreachable.** `predict.py` / `evaluate.py` raise
-  `EnvironmentError` or a `supabase` client exception; `keepalive.yml`'s ping
-  step will also be failing. Reopen the project in the Supabase dashboard
-  (unpausing is manual on the free tier) and re-run the workflow
-  (`workflow_dispatch`).
-- **NBA CDN block / 403.** **Confirmed on the first live runs:** cdn.nba.com
-  returns 403 from GitHub-hosted runners even with the correct `CDN_HEADERS`
-  (NBA blacklists cloud IP ranges); stats.nba.com times out from runners too;
-  ESPN's endpoints are reachable. Because the owner wants to keep NBA data, the
-  daily jobs route the CDN calls through the residential proxies in the
-  `NBA_PROXIES` secret. `nba_cdn` tries the proxies in order, sticks to the last
-  one that worked, and treats a 403 (or a connection error/timeout) from a proxy
-  as "this IP is blocked → fail over to the next". A 404 is still normal (game
-  not played yet → `fetch_boxscore()` returns `None`). If **every** proxy fails,
-  the fetch raises a summary naming each `proxy #i (host:port): <reason>` —
-  host:port only, never credentials — and the job fails loudly (silently skipping
-  a day's state update would be worse). **Fix:** rotate or replace the blocked
-  proxy in the `NBA_PROXIES` secret and re-run the workflow. **Verify proxies
-  first** with the manual **Check NBA Proxies** workflow (`check_nba_proxies.yml`,
-  `workflow_dispatch`) or locally:
-  `NBA_PROXIES='http://user:pass@host:port' python src/pipeline/nba_cdn.py --check`
-  — it fetches the schedule + a box score through each proxy individually and
-  prints status / size / latency, exiting 0 if at least one proxy fully works.
-- **State conflict / merge conflict on push.** `daily_evaluate.yml`'s commit
-  step already does `git pull --rebase origin <branch>` before `git push`, so
-  the common case — another commit landed on `main` between the checkout and
-  the push (e.g. a manual `workflow_dispatch` overlapping the schedule) — is
-  handled automatically. A genuine conflict (two runs racing on the *same*
-  state file, so the rebase itself can't apply cleanly) still needs manual
-  resolution — re-run `daily_state.py` locally against the current `main` and
-  push the result.
-- **Missing box score yet.** Not a failure — a 404 from the CDN is the normal
-  case for a game that hasn't been played yet. `daily_state.py` logs
-  `"box score not available yet"` and simply skips that game until a later
-  run picks it up (it re-scans from `LOOKBACK_DAYS` before the last logged
-  game every time, so nothing is lost).
+- **Drive quota block on the OE download.** Log: `OE download failed ...`
+  from `daily_state.py` (a body that is not the OE CSV, titled for example
+  "Google Drive - Quota exceeded"). Consequences: the state is not updated, the
+  Daily Evaluate run shows as failed, `evaluate` and `predict` still ran
+  (predict on the committed state). **Do nothing**: the next day's run catches
+  up, because every run rescans from 14 days (`LOOKBACK_DAYS`) before the last
+  logged game. Do not work around the block with chunked Range requests. If it
+  persists for days, download the current-year file by hand in a browser into
+  `src/data/raw/oe/` (original name; it is reused while its modification time
+  is under 20 hours old), run `python src/pipeline/daily_state.py` and commit
+  the state files. `python src/pipeline/oe.py --check` tells whether the block
+  is still active.
+- **Unmapped team.** Log: `unmapped team <code>/<name>` (and `unmapped team,
+  skipped` for the match); the match gets no prediction. Add a row to
+  `src/pipeline/team_aliases.csv`:
+  `lolesports_code,lolesports_name,oe_teamid`, with the code and name exactly
+  as lolesports spells them. Find the OE id from the committed log, for
+  example `grep -h "Team Name" src/data/raw/team_games_2026.csv | head -1 | cut -d, -f10`
+  (column 10 is `teamid`). A team that has no OE game yet cannot be mapped;
+  its matches stay skipped until OE has one. After the fix, re-run
+  **Daily Predictions** (`workflow_dispatch`) or check locally with
+  `python src/pipeline/predict.py --dry-run`. A name that matches several OE
+  teams logs `(ambiguous: n OE teamids)` and also needs an alias.
+- **Failed evaluate.** Each match is isolated: one failing lookup is logged
+  (`evaluation failed`), the others still resolve, `running_record` is still
+  recomputed, and `evaluate()` raises once at the end so the run is red. The
+  state update and its commit are unaffected. Re-running the workflow retries
+  the unresolved matches. A match that is still undecided 7 days after its
+  start (postponed, forfeited with 0-0 `gameWins`) only gets a warning;
+  nothing auto-voids, so fix such a row by hand in Supabase if it matters.
+- **Supabase paused or unreachable.** `predict.py` / `evaluate.py` raise
+  `EnvironmentError` or a `supabase` client exception, and the keepalive ping
+  fails too. Unpause the project in the Supabase dashboard (manual on the free
+  tier) and re-run the workflow.
+- **`42501 permission denied for table predictions`.** The GRANTs at the end of
+  `schema.sql` are missing (newer Supabase projects grant nothing by
+  default). Run them in the SQL editor, see
+  [Applying schema.sql](#applying-a-supabase-migration).
+- **lolesports API changed.** Calls raise on HTTP or shape errors rather than
+  returning an empty result, so a changed API shows up as a red run. Run
+  `python src/pipeline/lolesports.py --check`.
+- **Incomplete game in OE.** Not a failure: `daily_state.py` logs
+  `incomplete game (rows/roles/result), skipped for now` and a later run picks
+  it up. A game OE adds a day or more late (LPL especially) is applied in
+  arrival order; a full rebuild re-sorts.
+- **Push conflict on the state commit.** The commit step already does
+  `git pull --rebase` before `git push`, which handles another commit landing
+  in between. A genuine conflict (two runs touching the same state file) needs
+  manual resolution: re-run `daily_state.py` locally against current `main`
+  and push.
+- **Rare double write failure.** If `player_elo_current.parquet` is written but
+  `player_elo_recent.parquet` is not, the next run can double-count those
+  games. If a run logs a failure between the two writes, revert its state
+  commit (or restore both files from the previous commit) before the next run.
 
-## Re-enabling disabled workflows manually
+### Re-enabling disabled workflows manually
 
-If `keepalive.yml` itself is disabled (or hasn't run yet) and the daily
-workflows stop firing:
+If `keepalive.yml` itself is disabled and the daily workflows stop firing:
 
 ```bash
-gh workflow enable daily_evaluate.yml --repo <owner>/courtside-oracle
-gh workflow enable daily_predict.yml  --repo <owner>/courtside-oracle
-gh workflow enable keepalive.yml      --repo <owner>/courtside-oracle
+gh workflow enable daily_evaluate.yml --repo IcaruzSoftware/riftside-oracle
+gh workflow enable daily_predict.yml  --repo IcaruzSoftware/riftside-oracle
+gh workflow enable keepalive.yml      --repo IcaruzSoftware/riftside-oracle
 ```
+
+## Checking the sources
+
+```bash
+python src/pipeline/oe.py --check          # lists the Drive folder, starts a real download of the latest year, prints status / size / latency
+python src/pipeline/lolesports.py --check  # getLeagues; requires lck, lpl, lec, worlds
+```
+
+Both exit 0 on success, 1 on failure. `oe.py --check` deliberately starts a
+full (non-Range) download and reads only the first 20 KB, because Drive's quota
+block only affects full downloads. The same checks run from a GitHub runner
+via `check_sources.yml`.
 
 ## Full historical bootstrap / ELO rebuild
 
-Only needed if the raw data or ELO state is lost again, or to extend the
-historical window to a new season from scratch. Expect this to run for
-several hours unattended — the script is written for that (see
-`bootstrap_data.py`'s module docstring for the sleep-prevention and backoff
-behavior).
+Only needed if the raw data or the state is lost, or the ELO or feature logic
+changes. The raw files must be in `src/data/raw/oe/` (download by hand, or
+`python src/scripts/bootstrap_data.py`, about 856 MB; files younger than 20
+hours are skipped and `--force` re-downloads them).
 
 ```bash
-python src/scripts/bootstrap_data.py                 # phase 1 then phase 2, ~7h total
-python src/scripts/bootstrap_data.py --phase 1        # game logs + player season stats only (fast)
-python src/scripts/bootstrap_data.py --phase 2 --limit 3   # box scores, first 3 pending games (smoke test)
+python src/pipeline/elo.py --force                      # ~21 s, full 2014-2026 replay; also recomputes role_norms.json
+python src/pipeline/daily_state.py --init               # team_games_*.csv from the same OE files (delete the existing ones first)
+python src/pipeline/build_dataset.py --force            # ~35-65 s, 93,753 games since 2017
+python src/pipeline/train.py --trials 100 --force       # ~25-40 min
 ```
 
-Exit code is `2` if any game is still missing a box score at the end of a
-phase-2 run (see `src/data/raw/missing_boxscores.txt` for which ones) — safe
-to just re-run, it resumes from wherever it left off and never re-downloads a
-complete game.
+- Always rebuild the ELO before `build_dataset.py`: it reads the uncommitted
+  `player_elo.parquet`, and a stale one silently falls back to the current ELO
+  for later games (look-ahead).
+- `daily_state.py --init` refuses to overwrite: delete the existing
+  `src/data/raw/team_games_*.csv` first. Run it right after `elo.py --force`
+  so the CSVs and the ELO state are built from the same OE files and match.
+  Commit the ELO state only together with a fresh `--init`: otherwise the
+  games missing from `team_games` are lost for good, because `daily_state`
+  only passes gameids that are new to `team_games`.
+- `elo.py --force` prints the top 10 players by `outcome_elo`; well-known
+  LCK/LPL names should dominate.
+- `train.py` prints the test-slice metrics, both baselines and a `GATE` line
+  (PASS only if the calibrated model beats the outcome-ELO baseline on log loss
+  **and** accuracy on the major-league slice). Do not ship a FAIL without
+  looking at it. Details in [model.md](model.md).
+- Commit only the state files (`team_games_*.csv`, the two `player_elo_*`
+  parquets, `role_norms.json`) and `src/models/xgb_model.pkl`. Never the raw OE
+  files, `player_elo.parquet` or `feature_matrix.parquet`.
+- Retraining is not part of the daily pipeline. Re-pin `scikit-learn` and
+  `xgboost` in `requirements.txt` together if you change the training
+  versions.
 
-Then rebuild ELO from the downloaded box scores:
+<a id="applying-a-supabase-migration"></a>
 
-```bash
-python src/pipeline/elo.py --force
-```
+## Applying schema.sql on a new Supabase project
 
-This writes `player_elo.parquet` (full history, not committed) and the two
-committed state files (`player_elo_current.parquet`,
-`player_elo_recent.parquet`). **Commit only the state files** — never the
-contents of `src/data/raw/` or `player_elo.parquet` (see [data.md](data.md)
-for exactly what `.gitignore` allows through).
+There is no `migrations/` directory: a fresh project is set up by running
+`src/supabase/schema.sql` once in the Supabase SQL editor. It creates
+`predictions`, `shap_values` and `running_record` (seeded with one zero row),
+the indexes, the RLS policies (public `SELECT` only), and the table GRANTs.
+Everything in it is idempotent (`IF NOT EXISTS`, `DROP POLICY IF EXISTS`,
+`ON CONFLICT DO NOTHING`), so it is safe to re-run; it does not alter a table
+that already exists in a different shape, so a column change on a live
+database needs a hand-written `ALTER TABLE`.
 
-If you also need to retrain the model against the new data, continue with
-`python src/pipeline/build_dataset.py` then `python src/pipeline/train.py`
-(see [model.md](model.md)).
+**The GRANTs are required.** Newer Supabase projects do not grant table
+privileges by default, and without them the first predict run fails with
+`42501 permission denied for table predictions`, even with the service-role
+key. The last statements of `schema.sql` (schema `USAGE`; full CRUD for
+`service_role`; `SELECT` for `anon` and `authenticated`) fix that. If you
+created the tables some other way, run just those statements.
 
-## Applying a Supabase migration
+After creating the project:
 
-New setups: run `src/supabase/schema.sql` once in the Supabase SQL editor —
-it already includes everything, including `game_time_utc` and the RLS
-policies.
-
-Existing deployments created before `game_time_utc` / RLS existed: apply
-`src/supabase/migrations/001_game_time_and_rls.sql` in the SQL editor. It's
-idempotent (`ADD COLUMN IF NOT EXISTS`, `DROP POLICY IF EXISTS` before each
-`CREATE POLICY`) — safe to re-run.
-
-**Apply migration 001 before deploying any web build that queries
-`game_time_utc`** (the `/card` page's live/upcoming/tipoff-label logic reads
-this column via `getCardPrediction()` in `web/lib/supabase.ts`) — querying a
-column that doesn't exist yet fails that request outright on an
-unmigrated database.
+1. Put the project URL and the **service-role** key into the GitHub secrets
+   `SUPABASE_URL` / `SUPABASE_KEY`.
+2. Put the URL and the **anon** key into `web/.env.local`.
+3. Enable the workflows.
 
 ## Deploying the web app
 
-**Not automatic — pushing to `main` does not update the live site.** The
-site is a static export (`output: "export"` in `next.config.ts`) served from
-the owner's own Plesk/nginx server (confirmed: `courtside-oracle.gerritvisser.de`
-and `gerritvisser.de` both resolve to the same server, 185.45.149.138; the
-live `/card` files on it date from 2026-06-19). There's a Vercel project
-somewhere in this repo's history too, but what's actually serving the live
-site is that Plesk server — treat Vercel as not relevant to the deploy
-procedure below.
+**Not automatic: pushing to `main` will not update the site.** The site is a
+static export (`output: "export"` in `web/next.config.ts`), to be served by the
+owner's Plesk/nginx server (not deployed yet). Because it is static, all data fetching happens in
+the browser directly against Supabase (anon key), so new predictions and
+results show up without a redeploy. Only code or layout changes need the steps
+below.
 
-Because it's a static export, all data fetching happens client-side in the
-browser directly against Supabase (anon key) — so changes to the *data*
-(predictions, running record) show up immediately with no redeploy. Only
-code/layout changes need the steps below.
-
-Deploy procedure:
-
-1. Create `web/.env.local` (gitignored, never commit it) with the two
-   build-time env vars — both are public values that get baked into the
-   static JS bundle, not secrets:
+1. Create `web/.env.local` (gitignored, never commit it) from
+   `web/.env.local.example`. Both values are public and get baked into the
+   static JS bundle:
    ```
-   NEXT_PUBLIC_SUPABASE_URL=https://pxvimjflsishbfrublwp.supabase.co
+   NEXT_PUBLIC_SUPABASE_URL=https://pdblqlbgrelyqjgkpdte.supabase.co
    NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon key>
    ```
-2. **If this build is the first one to query `game_time_utc`**, confirm
-   [migration 001 has been applied](#applying-a-supabase-migration) to the
-   target Supabase project first — otherwise the `/card` page's
-   `getCardPrediction()` query fails outright.
-3. Build locally:
+   **Anon key only, never the service-role key.** Without these variables the
+   build still succeeds, but `next.config.ts` prints a warning and the pages
+   show empty states.
+2. Build locally:
    ```bash
-   cd web && npm run build
+   cd web && npm install && npm run build
    ```
    This produces the static export in `web/out/`.
-4. Manually upload the contents of `web/out/` to the
-   `courtside-oracle.gerritvisser.de` subdomain's document root on the Plesk
-   server.
+3. Manually upload the contents of `web/out/` to the document root of the
+   Riftside Oracle subdomain on the Plesk server. The site metadata assumes
+   `https://riftside-oracle.gerritvisser.de`.
 
-**The CSP `frame-ancestors` header that allows `/card` to be iframed on
-gerritvisser.de is set by the server/nginx config, not by the Next.js app** —
-a static export can't set response headers itself (`next.config.ts`'s
-`headers()` doesn't run in `output: "export"`). That header must stay
-configured server-side independently of anything in this repo; it won't
-survive a server/vhost change unless someone re-adds it there.
+**For `/card` to be iframed on gerritvisser.de, a CSP `frame-ancestors` header
+must be set in the server/nginx config when deploying, not by the Next.js app**:
+a static export cannot set response headers itself. Re-check it after any
+vhost change.
 
-Local dev: `cd web && npm install && npm run dev`. `npm run lint` runs
-`next lint`.
+The `/card` route (420×260) is the standalone widget meant to be embedded as an
+iframe on the portfolio site (`IcaruzSoftware/portfolio`, https://gerritvisser.de);
+the embed is an open owner step (see [HANDOFF.md](../HANDOFF.md)). Once embedded,
+the iframe points at the subdomain's `/card`, so uploading a new build updates
+the embedded card too. A breaking change to `/card`'s markup or query must be
+avoided and needs a check in that repo.
 
-The `/card` route (420×260) is the standalone widget embedded as an iframe on
-the portfolio site (`IcaruzSoftware/portfolio`, https://gerritvisser.de) —
-the iframe points at `https://courtside-oracle.gerritvisser.de/card`, so
-uploading a new build updates the embedded card too; there is nothing to
-change in the portfolio repo itself unless the iframe URL changes.
+Local development: `cd web && npm install && npm run dev`; `npm run lint`
+runs `next lint`. If `next dev` crashes with "segment-explorer-node", it is
+sharing `web/.next` with `npm run build`: delete `web/.next`.
+
+### Previewing the web app without data
+
+- `/demo` renders `GameCard` with mock rows (upcoming with SHAP, resolved
+  correct and wrong, no logos or a long team name), labelled "demo / not real
+  data". It exists in the static export too.
+- `?demo=1` on any page (`/?demo=1`, `/card?demo=1`) serves the mock rows
+  from `web/lib/mock.ts` instead of Supabase, **only under `npm run dev`**
+  (gated on `NODE_ENV`, so the production build ignores it). The mock times
+  are relative to the viewer's today.
 
 ## Season rollover
 
-Nothing to run manually — season boundaries are derived from dates
-everywhere (`_season_of()` / `_date_to_season()`: October or later = new
-season). 2026-27: preseason from 2026-10-03, regular season opens
-2026-10-20. The public running record only counts predictions with
-`game_date >= RECORD_START` (currently `"2026-10-01"`, in `evaluate.py`) —
-bump this constant if you want the ticker to reset for a new season instead
-of accumulating across seasons. The 5 rows inserted by `seed_finals.py` (the
-2026 Finals, predicted retroactively) have earlier `game_date`s and are
-excluded by this cutoff regardless.
+Nothing to run manually. OE publishes a new year file with a new Drive id each
+January; `oe.list_files()` resolves ids from the folder view on every run, and
+`daily_state.py` reads both the previous and the current year file in early
+January.
+
+- The public record only counts predictions with `match_date >= RECORD_START`
+  (`"2026-10-15"` in `evaluate.py`). Bump the constant to reset the ticker.
+- League renames between seasons (OE and lolesports codes) need the sets
+  updated: `predict.PREDICT_LEAGUES` / `OE_LEAGUE`, `elo.LEAGUE_PRIOR` /
+  `elo.INTERNATIONAL`, `train.MAJOR`. See
+  [data.md](data.md#shape-and-quirks) for how codes changed in the past.
+- Rosters change in the off-season, so early-season predictions are the
+  weakest; see [model.md](model.md).

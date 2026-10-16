@@ -34,7 +34,7 @@ Training vs live (the one difference: rosters)
   starters  training: the 5 who played (team_games row of game_id); live: the
             team's latest lineup before d (or the caller's starters)
   missing   training: an empty slot / unknown id is left out of team means (its
-            lane diffs are NaN); live: §5.2 init value (outcome = mean of current
+            lane diffs are NaN); live: init value (docs/elo.md) (outcome = mean of current
             players last seen in the team's home league if >= 10, else the league
             prior; skills 1000 each)
   form      training: history snapshots; live: player_elo_recent.parquet
@@ -137,7 +137,7 @@ def _player(g: "_Game", pid) -> tuple[np.ndarray | None, int]:
 
 
 def _init(g: "_Game", league) -> np.ndarray:
-    """Live §5.2 init vector for a player missing from the ELO state."""
+    """Live init vector (see docs/elo.md) for a player missing from the ELO state."""
     s, c = g.st["league"].get(league, (0.0, 0))
     o = s / c if c >= elo.MIN_LEAGUE_PLAYERS else elo.LEAGUE_PRIOR.get(league, elo.DEFAULT_PRIOR)
     return np.array([o, elo.INITIAL_ELO * len(elo.SKILLS)] + [elo.INITIAL_ELO] * len(elo.SKILLS))
