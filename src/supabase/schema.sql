@@ -82,3 +82,11 @@ DROP POLICY IF EXISTS "public read running_record" ON running_record;
 CREATE POLICY "public read predictions"    ON predictions    FOR SELECT USING (true);
 CREATE POLICY "public read shap_values"    ON shap_values    FOR SELECT USING (true);
 CREATE POLICY "public read running_record" ON running_record FOR SELECT USING (true);
+
+-- ---------------------------------------------------------------------------
+-- Table privileges — newer Supabase projects no longer grant these by default
+-- (without them even the service role gets "permission denied", 42501).
+-- ---------------------------------------------------------------------------
+GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON predictions, shap_values, running_record TO service_role;
+GRANT SELECT ON predictions, shap_values, running_record TO anon, authenticated;
