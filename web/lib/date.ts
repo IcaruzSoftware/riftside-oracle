@@ -1,13 +1,18 @@
 /**
- * Returns a date formatted as "YYYY-MM-DD" in US Eastern time (America/New_York),
- * matching the format of the `game_date` column. Using UTC (e.g. `toISOString()`)
- * is wrong here because it rolls over to the next day ~8pm ET.
+ * Returns a date formatted as "YYYY-MM-DD" in the viewer's local time zone.
+ * Matches are grouped by the viewer's local date of `start_time_utc`, not by the
+ * `match_date` column (which is the UTC date).
  */
-export function getEasternDateString(date: Date = new Date()): string {
+export function getLocalDateString(date: Date = new Date()): string {
   return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/New_York",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
   }).format(date);
+}
+
+/** Start (inclusive) and end (exclusive) of the viewer's local day containing `date`. */
+export function getLocalDayBounds(date: Date): [Date, Date] {
+  const [y, m, d] = [date.getFullYear(), date.getMonth(), date.getDate()];
+  return [new Date(y, m, d), new Date(y, m, d + 1)];
 }

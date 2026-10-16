@@ -2,13 +2,13 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Courtside Oracle | NBA Predictions",
-  description: "XGBoost-powered NBA game outcome predictions with player ELO ratings and SHAP explanations.",
+  title: "Riftside Oracle | LoL Esports Predictions",
+  description: "XGBoost-powered League of Legends esports match predictions with player ELO ratings and SHAP explanations.",
   openGraph: {
-    title: "Courtside Oracle",
-    description: "NBA game predictions powered by machine learning.",
-    url: "https://courtside-oracle.gerritvisser.de",
-    siteName: "Courtside Oracle",
+    title: "Riftside Oracle",
+    description: "League of Legends esports match predictions powered by machine learning.",
+    url: "https://riftside-oracle.gerritvisser.de",
+    siteName: "Riftside Oracle",
   },
 };
 

@@ -1,4 +1,4 @@
-# Handoff: Riftside Oracle (status 2026-10-15, end of day)
+# Handoff: Riftside Oracle (status 2026-10-16)
 
 Read this first in a new session, then [CLAUDE.md](CLAUDE.md) and the spec
 [RIFTSIDE_HANDOVER.md](RIFTSIDE_HANDOVER.md). Where this file and the spec
@@ -6,10 +6,10 @@ disagree, this file records a later decision and wins.
 
 ## TL;DR
 
-- **Phases 0–4 of the handover are done, plus one model-improvement round.** Each one is committed, tested and was reviewed by two independent reviewers.
-- **Next step: Phase 5**, the web app (§8.2 of RIFTSIDE_HANDOVER.md). `schema.sql` is already done (see decision 12). Then Phase 6 (docs).
-- **The daily pipeline works:** `daily_state.py`, `predict.py`, `evaluate.py` and `daily_run.py` are LoL code now, no longer broken NBA code. 91 tests, all passing.
-- **The workflows are still disabled on GitHub.** The owner enables them once the secrets are set (see open point 4).
+- **Phases 0–5 of the handover are done, plus one model-improvement round.** Each one is committed and tested; every phase was reviewed by two independent reviewers.
+- **Next step: Phase 6**, the docs: rewrite CLAUDE.md, README.md and docs/*.md for Riftside and remove the NBA references (RIFTSIDE_HANDOVER.md §9 Phase 6).
+- **The daily pipeline works and is live** (since 2026-10-16, see "Live since 2026-10-16"): `daily_state.py`, `predict.py`, `evaluate.py` and `daily_run.py` are LoL code now, no longer broken NBA code. 91 tests, all passing.
+- **The web app is built** (Phase 5), but not yet deployed and not yet checked against real Supabase data (see open point 4).
 - **Model quality, at the level that matters to the owner (who wins the match):**
   - about **70% series accuracy** on the test period 2025-05-20..2026-10-14: 6,260 series across all leagues;
   - **69.9% on the major leagues**: 1,453 series; 72.7% in Bo3s.
@@ -45,7 +45,7 @@ uv pip install --python .venv/bin/python -r requirements.txt pytest
 - **GitHub state:**
   - The repo is pushed.
   - `check_sources.yml` passed on a GitHub runner, so OE and lolesports need no proxies.
-  - `Daily Evaluate`, `Daily Predictions` and `Keepalive` are **disabled** on GitHub until the owner has set the secrets. Keepalive re-enables the others, which is why it is off too.
+  - `Daily Evaluate`, `Daily Predictions` and `Keepalive` are **enabled** and the secrets are set (since 2026-10-16).
 
 ## Commits so far
 
@@ -57,7 +57,16 @@ uv pip install --python .venv/bin/python -r requirements.txt pytest
 | 47b92b0 | Phase 2: player ELO (5 role-normalised skills + outcome ELO) |
 | ee312df | Phase 3: features, dataset, training, baseline gate |
 | 0435478, 3ee0afc, bebc2b6 | Improvement round: refined outcome ELO, Optuna fix, committed state + model, this file |
-| (this commit) | Phase 4: daily pipeline (`daily_state`, `predict`, `evaluate`, `daily_run`), workflows, `team_games_*.csv`, `schema.sql` |
+| 3cc93f2 | Phase 4: daily pipeline (`daily_state`, `predict`, `evaluate`, `daily_run`), workflows, `team_games_*.csv`, `schema.sql` |
+| d00edc0 | `schema.sql`: explicit GRANTs |
+| (this commit) | Phase 5: web app (Next.js static export, `/card` widget, `/demo`) |
+
+## Live since 2026-10-16
+
+- The owner created the Supabase project (`https://pdblqlbgrelyqjgkpdte.supabase.co`), ran `schema.sql`, set the GitHub secrets and enabled the workflows.
+- The first predict run failed with 42501 "permission denied for table predictions". Newer Supabase projects don't grant table privileges by default.
+  - Fix: explicit GRANTs at the end of `schema.sql` (service_role full CRUD; anon/authenticated SELECT). The owner ran them in the SQL editor.
+- First Worlds day (2026-10-15, predicted ad hoc from the committed state): KC over C9 correct, FURIA over MVK wrong.
 
 ## Decisions made (by the owner or with the owner's OK) and deviations from the spec
 
@@ -112,6 +121,27 @@ uv pip install --python .venv/bin/python -r requirements.txt pytest
   - evaluate runs on cron `45 7 * * *` and commits state even if evaluate itself failed;
   - predict runs on `workflow_run` with any conclusion, plus crons `0 3` and `0 15`;
   - bot `riftside-oracle[bot]`; `NBA_PROXIES` removed.
+
+## Phase 5: implementation choices
+
+- **No team table:** `lib/teams.ts` was deleted; names and logos come from the row. `TeamLogo` rewrites http→https for static.lolesports.com and falls back to a grey circle with the team code.
+- **Home page** groups by the viewer's local date:
+  - Today (ascending);
+  - Upcoming: unresolved, later days, ascending (needed because predict runs up to 36h ahead);
+  - Recent: earlier days, newest first.
+- **GameCard:** `league_name · Bo{n}`, a series-win split bar coloured relative to the pick, and the score (team1-team2) once resolved.
+  - SHAP shows the top 5 of the stored 10 by |value|. Feature names are mapped to readable labels (all 136 model features covered); blue_ = team1.
+- **`/card`** (420×260, public interface unchanged, iframed from the portfolio repo):
+  - the live window is best_of × 1h;
+  - a resolved match shows the actual winner plus "✓ Correct · Pick X (nn%)";
+  - long names use line-clamp-2 and a smaller size.
+- **"About the model"** hardcodes 70.2% series (6,260), 69.9% major (1,453), 65.3% game accuracy and log loss 0.618, plus the 69.8% ELO baseline in the Limits paragraph.
+- **Texts:** Riot disclaimer verbatim, and "Match data: Oracle's Elixir and lolesports". No betting language.
+- **Without env vars** the build still succeeds: the Supabase client is null, the pages show empty states, and `next.config.ts` prints a warning.
+- **Previewing:** `/demo` (public, labelled as demo data) and `?demo=1` on any page, the latter **only under `npm run dev`** (gated by NODE_ENV). Mock rows are in `lib/mock.ts`, placed relative to the viewer's today.
+- Package renamed to riftside-oracle; no new dependencies.
+- **Dev gotcha:** `next dev` can crash ("segment-explorer-node") if it shares `web/.next` with `npm run build`; delete `web/.next`.
+- **Not verified against real Supabase data yet** (no anon key locally).
 
 ## Model: results and what was tried
 
@@ -199,7 +229,7 @@ Method: walk-forward validation over 3 windows (2021-07..2025-05, all before the
 - **Daily job:** it downloads the current year's file (~78 MB) every morning. Decision 8 covers a blocked download: fail loudly, still evaluate and predict on the committed state, catch up the next day.
 - **lolesports API:** works with the public site key and needs no proxy.
 
-## Open points for Phase 5 and later
+## Open points for Phase 6 and later
 
 1. **Known small issues (nits):**
    - `league_tier` is 1350 for internationals (`is_international` distinguishes them).
@@ -220,8 +250,12 @@ Method: walk-forward validation over 3 windows (2021-07..2025-05, all before the
    - `role_norms` are computed over 2022–2025.
    - `team_games_*.csv` are committed state written by `daily_state`.
 4. **Owner-only steps** (spec §10):
-   - Done: the Supabase project is created and `schema.sql` has been run.
-   - Still to do: set the GitHub secrets `SUPABASE_URL` and `SUPABASE_KEY` (service-role); enable the workflows; set up the Plesk subdomain (Phase 5).
+   - Done: the Supabase project, `schema.sql` (incl. GRANTs), the GitHub secrets and the enabled workflows.
+   - Still to do:
+     - create `web/.env.local` with `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` (anon key only);
+     - set up the Plesk subdomain (the OG URL assumes `https://riftside-oracle.gerritvisser.de`, still to be confirmed);
+     - build and upload `web/out/`, as described in docs/operations.md (still the NBA text until Phase 6);
+     - set the CSP `frame-ancestors` for `/card`.
 5. **Odd but plausible ELO observations:**
    - The mean outcome ELO of players whose last game was in LPL (≈1615) is below LEC (≈1690). One reason: many stars' last game is currently Worlds.
    - Two EMEA Masters players reach the overall outcome top 10 (~1920).

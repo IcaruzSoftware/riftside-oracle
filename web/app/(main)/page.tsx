@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { getRecentPredictions, getRunningRecord, getShapValues } from "@/lib/supabase";
-import { getEasternDateString } from "@/lib/date";
+import { getLocalDateString } from "@/lib/date";
 import GameCard from "@/components/GameCard";
 import RecordStats from "@/components/RecordStats";
 import RecentPredictionsTable from "@/components/RecentPredictionsTable";
@@ -25,12 +25,11 @@ export default function HomePage() {
       setPredictions(preds);
       setRecord(rec);
 
-      const today = getEasternDateString();
-      const todaysPredictions = preds.filter(p => p.game_date === today);
+      const { today, upcoming } = splitByDay(preds);
 
-      // Fetch SHAP values for today's games
+      // Fetch SHAP values for today's and upcoming matches (the ones shown as cards)
       const shapEntries = await Promise.all(
-        todaysPredictions.map(async (p): Promise<[string, ShapValue[]]> => {
+        [...today, ...upcoming].map(async (p): Promise<[string, ShapValue[]]> => {
           try {
             return [p.id, await getShapValues(p.id)];
           } catch {
@@ -48,9 +47,11 @@ export default function HomePage() {
     };
   }, []);
 
-  const today = getEasternDateString();
-  const todaysPredictions = predictions.filter(p => p.game_date === today);
-  const recentPredictions = predictions.filter(p => p.game_date !== today);
+  const {
+    today: todaysPredictions,
+    upcoming: upcomingPredictions,
+    recent: recentPredictions,
+  } = splitByDay(predictions);
 
   return (
     <div className="space-y-12">
@@ -59,7 +60,9 @@ export default function HomePage() {
       <section>
         <SectionHeader icon="📅" label="TODAY'S PREDICTIONS" />
         {todaysPredictions.length === 0 ? (
-          <EmptyState message="No games scheduled today. Check back tomorrow." />
+          <EmptyState message={upcomingPredictions.length > 0
+            ? "No matches scheduled today. See the upcoming matches below."
+            : "No matches scheduled today. Check back tomorrow."} />
         ) : (
           <div className="grid gap-4 sm:grid-cols-2">
             {todaysPredictions.map(p => (
@@ -68,6 +71,18 @@ export default function HomePage() {
           </div>
         )}
       </section>
+
+      {/* Upcoming predictions (later local days) */}
+      {upcomingPredictions.length > 0 && (
+        <section>
+          <SectionHeader icon="⏭" label="UPCOMING" />
+          <div className="grid gap-4 sm:grid-cols-2">
+            {upcomingPredictions.map(p => (
+              <GameCard key={p.id} prediction={p} shap={shapMap[p.id]} />
+            ))}
+          </div>
+        </section>
+      )}
 
       {/* Running record */}
       <section>
@@ -92,10 +107,10 @@ export default function HomePage() {
 
           <div className="grid sm:grid-cols-4 gap-4">
             {[
-              { label: "Accuracy",  value: "67.5%",  note: "on 2,116 held-out games" },
-              { label: "AUC-ROC",   value: "0.729",  note: "higher = better separation" },
-              { label: "Brier",     value: "0.209",  note: "lower = better calibration" },
-              { label: "Log Loss",  value: "0.606",  note: "random guess = 0.693" },
+              { label: "Series Accuracy", value: "70.2%", note: "6,260 held-out series, all leagues" },
+              { label: "Major Leagues",   value: "69.9%", note: "1,453 held-out series" },
+              { label: "Game Accuracy",   value: "65.3%", note: "single games, all leagues" },
+              { label: "Log Loss",        value: "0.618", note: "per game; coin flip = 0.693" },
             ].map(({ label, value, note }) => (
               <div key={label} className="bg-brand-bg rounded-xl px-4 py-3 border border-brand-border">
                 <p className="text-[10px] tracking-widest uppercase text-brand-muted mb-1">{label}</p>
@@ -109,26 +124,38 @@ export default function HomePage() {
             <div>
               <p className="text-xs font-bold tracking-widest uppercase text-white mb-1">How it works</p>
               <p>
-                Each prediction is made by an <span className="text-white">XGBoost</span> binary
-                classifier trained on <span className="text-white">14,108 NBA games</span> spanning
-                11 seasons (2015-16 through 2025-26). Before every game, a feature vector is assembled
-                from recent team form, head-to-head history, rest days, injury reports, and a custom{" "}
-                <span className="text-white">player ELO system</span> that tracks 7 skill dimensions
-                (scoring, efficiency, defense, playmaking, rebounding, and two composite ratings)
-                across a player's entire career.
+                Every pro player has a custom <span className="text-white">player ELO</span>: five
+                skill ratings (combat, damage, economy, laning, vision), each compared only against
+                players in the same role, plus an <span className="text-white">outcome ELO</span>{" "}
+                that moves with wins and losses. Before a match, the two rosters&apos; ratings are
+                combined with recent team form, head-to-head history, schedule and roster changes,
+                and an <span className="text-white">XGBoost</span> classifier turns them into the
+                chance of winning a single game, averaged over both sides of the map. That per-game
+                chance is then compounded into the chance of winning the Bo1, Bo3 or Bo5 series.
               </p>
             </div>
 
             <div>
               <p className="text-xs font-bold tracking-widest uppercase text-white mb-1">Training</p>
               <p>
-                The dataset was split chronologically: <span className="text-white">9,875 games</span> for
-                training, 2,116 for calibration, and 2,116 for the held-out test set. This ensures
-                the model never sees future games during training. Hyperparameters were tuned with{" "}
-                <span className="text-white">Optuna</span> using time-series cross-validation.
-                Raw probabilities are then passed through a{" "}
-                <span className="text-white">Platt scaler</span> (logistic regression on the
-                calibration set) to produce well-calibrated confidence values.
+                The model was trained on pro games from{" "}
+                <span className="text-white">Oracle&apos;s Elixir</span> since 2017, split
+                chronologically so it never sees the future. Hyperparameters were tuned with{" "}
+                <span className="text-white">Optuna</span>, and the raw probabilities pass through a{" "}
+                <span className="text-white">Platt scaler</span> so the percentages are well
+                calibrated. The numbers above come from a held-out test period (May 2025 to
+                October 2026) that was never used for any modelling choice.
+              </p>
+            </div>
+
+            <div>
+              <p className="text-xs font-bold tracking-widest uppercase text-white mb-1">Limits</p>
+              <p>
+                Predictions are made <span className="text-white">before the draft</span>, so
+                champion picks, which decide many games, are unknown. That puts a ceiling on any
+                pre-draft model: about 65% per single game is close to it. Most of the signal
+                comes from the outcome ELO alone (picking the higher-rated team is right in 69.8% of
+                series), and many matchups are close to a coin flip.
               </p>
             </div>
 
@@ -148,6 +175,22 @@ export default function HomePage() {
 
     </div>
   );
+}
+
+/**
+ * Groups by the viewer's local date of start_time_utc: today (ascending), unresolved
+ * matches on later days (ascending), and earlier days (newest first).
+ */
+function splitByDay(preds: Prediction[]) {
+  const today = getLocalDateString();
+  const day = (p: Prediction) => getLocalDateString(new Date(p.start_time_utc));
+  const byStart = (a: Prediction, b: Prediction) =>
+    new Date(a.start_time_utc).getTime() - new Date(b.start_time_utc).getTime();
+  return {
+    today: preds.filter(p => day(p) === today).sort(byStart),
+    upcoming: preds.filter(p => day(p) > today && p.actual_winner === null).sort(byStart),
+    recent: preds.filter(p => day(p) < today).sort((a, b) => byStart(b, a)),
+  };
 }
 
 function SectionHeader({ icon, label }: { icon: string; label: string }) {
