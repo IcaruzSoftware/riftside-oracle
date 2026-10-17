@@ -194,19 +194,35 @@ row when `resolve_team` logs an unmapped team (see
 
 ## Data access rules
 
-- **OE via Google Drive.** `oe.download_year()` uses the no-auth download
-  endpoint `https://drive.usercontent.google.com/download?id=<id>&export=download&confirm=t`
-  and checks that the body starts with `gameid,`. Drive can answer scripted
-  full downloads with a "Quota exceeded" page for up to 24 hours (it did on
-  2026-10-15, even for the 2014 file, while small Range requests still
-  worked). We do **not** chunk around the quota with Range requests, because
-  that would circumvent Google's limit. There is no Drive API path and OE's old
+- **OE via Google Drive.** With `GOOGLE_DRIVE_API_KEY` set (the owner's API
+  key; a GitHub secret in CI), `oe.list_files()` uses the Drive API v3
+  `files.list` (`'<FOLDER_ID>' in parents and trashed=false`, shared drives
+  included) and
+  `oe.download_year()` uses `https://www.googleapis.com/drive/v3/files/<id>?alt=media`.
+  The key goes only in the `X-Goog-Api-Key` header, never in a URL, exception
+  or log. One API redirect to an https `*.googleusercontent.com` /
+  `*.googleapis.com` host is followed with a plain request without the key;
+  any other redirect is an error. Without a key (unset, empty or
+  blank) both use the public links: the
+  embedded folder view HTML and the no-auth download endpoint
+  `https://drive.usercontent.google.com/download?id=<id>&export=download&confirm=t`.
+  Either way the body must start with `gameid,`. A Drive API quota error
+  (`downloadQuotaExceeded`, `quotaExceeded`, `rateLimitExceeded`, ..., HTTP 429
+  or `RESOURCE_EXHAUSTED`) falls back to the public link once, for the listing
+  and the download separately; an invalid key, a missing file or any other API
+  error fails with its own message and no fallback. Drive can answer scripted public full downloads
+  with a "Quota exceeded" page for up to 24 hours (it did on 2026-10-15, even
+  for the 2014 file, while small Range requests still worked). The per-file
+  download quota may also apply to API downloads, so the key makes a block less
+  likely but not impossible. We do **not** chunk around the quota with Range
+  requests, because that would circumvent Google's limit. OE's old
   S3 mirror is gone. A blocked download is a loud failure: `daily_state.py`
   raises, the state stays as committed, `evaluate` and `predict` still run on
   the committed state, the job exits non-zero, and the next day's run catches
   up through `LOOKBACK_DAYS = 14`. A full historical download is therefore
-  best done by hand from the Drive folder in a browser. `oe.py --check` starts
-  a real (non-Range) download, so it detects the block.
+  best done by hand from the Drive folder in a browser. `oe.py --check` says
+  which path it uses (Drive API or public link) and starts a real (non-Range)
+  download, so it detects the block.
 - **lolesports API**: works from GitHub-hosted runners and from a home PC with
   the public key. No proxy is needed or used (`check_sources.yml` passed on a
   GitHub runner).

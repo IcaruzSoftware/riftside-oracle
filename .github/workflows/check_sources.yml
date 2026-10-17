@@ -22,6 +22,8 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Check Oracle's Elixir
+        env:
+          GOOGLE_DRIVE_API_KEY: ${{ secrets.GOOGLE_DRIVE_API_KEY }}   # optional; empty = public link
         run: python src/pipeline/oe.py --check
 
       - name: Check lolesports API

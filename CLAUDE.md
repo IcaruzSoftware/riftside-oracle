@@ -80,7 +80,7 @@ Python **3.12** (matches CI; the pins don't install on 3.13+). Use a local
 
 ```bash
 pip install -r requirements.txt pytest                    # pytest is not in requirements.txt
-python -m pytest                                           # 91 tests, via pytest.ini
+python -m pytest                                           # 118 tests, via pytest.ini
 python src/scripts/daily_run.py                             # evaluate + state update + predict (UTC date)
 python src/scripts/daily_run.py --predict --dry-run         # print predictions, write nothing
 python src/scripts/daily_run.py --evaluate --dry-run
@@ -124,12 +124,24 @@ history) and `feature_matrix.parquet`. File-by-file table:
 
 - **Oracle's Elixir (OE)** — the only stats source, for history *and* the
   daily job. One CSV per year in a public Google Drive folder (id in
-  `oe.FOLDER_ID`); `oe.py` resolves file ids by parsing the embedded folder
-  view, so a new year's file needs no code change. OE refreshes about 07:05
+  `oe.FOLDER_ID`); `oe.py` resolves file ids from the Drive API listing with a
+  key, else by parsing the embedded folder view, so a new year's file needs no
+  code change. OE refreshes about 07:05
   UTC and lags about a day; the current-year file is ~78 MB. Local files
   younger than 20 h are reused.
+- **Drive API key:** with `GOOGLE_DRIVE_API_KEY` set (the owner's own key, a
+  GitHub secret), `oe.py` lists the folder and downloads through the Drive API
+  v3 (`files.list`, `files.get?alt=media`), the key sent only in the
+  `X-Goog-Api-Key` header (never in a URL or log; one redirect to an https
+  `*.googleusercontent.com` / `*.googleapis.com` host is followed without the key).
+  Unset, empty or blank = the public links (folder view HTML +
+  `drive.usercontent.google.com`), as in the tests. Locally, set the variable
+  in the shell to use the API for `bootstrap_data.py` / `daily_state.py`. An
+  API quota error (403 quota reasons, 429, `RESOURCE_EXHAUSTED`) falls back to
+  the public link once, for the listing and the download separately.
 - **Drive quota:** on 2026-10-15 every scripted full download got Drive's
-  "Quota exceeded" page. Do **not** chunk around it with Range requests. A
+  "Quota exceeded" page. The per-file download quota may still apply to API
+  downloads. Do **not** chunk around it with Range requests. A
   blocked download makes the state update fail loudly (the run exits 1), but
   evaluate and predict still run on the committed state, and the next day's
   run catches up through `LOOKBACK_DAYS = 14`. For a local rebuild, download
@@ -190,6 +202,10 @@ history) and `feature_matrix.parquet`. File-by-file table:
   at build time — **never the same key in both places**. Newer Supabase
   projects grant no table privileges by default, so `schema.sql` ends with
   explicit GRANTs.
+- **Google Drive API key** (owner's Google Cloud project, restricted to the
+  Drive API) in the GitHub secret `GOOGLE_DRIVE_API_KEY`, passed to
+  `daily_evaluate.yml` and `check_sources.yml`; optional (empty = public links).
+  How to create it: [docs/operations.md](docs/operations.md#creating-the-drive-api-key).
 - **The owner's Plesk server** (nginx) is meant to serve the static export (not
   deployed yet). No auto-deploy — see
   [docs/operations.md](docs/operations.md#deploying-the-web-app). For `/card`

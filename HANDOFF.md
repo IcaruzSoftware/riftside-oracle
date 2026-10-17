@@ -6,7 +6,7 @@ the status and decision log; CLAUDE.md is the working guide; `docs/` has the dep
 ## TL;DR
 
 - **Phases 0–6 are done** (data layer, ELO, features and training, daily pipeline, web app, docs), plus one model-improvement round. Each phase is committed and was reviewed by two independent reviewers.
-- **The daily pipeline is live** since 2026-10-16 (see "Live setup"). 91 tests, all passing.
+- **The daily pipeline is live** since 2026-10-16 (see "Live setup"). 118 tests, all passing.
 - **The web app is built but not deployed** and not yet checked against real Supabase data (no anon key locally).
 - **Next steps are owner-only** (see "Next steps"): `web/.env.local`, the Plesk subdomain, the build and upload, the CSP `frame-ancestors` header.
 - **Model quality, at the level that matters (who wins the series):**
@@ -20,7 +20,7 @@ the status and decision log; CLAUDE.md is the working guide; `docs/` has the dep
 git clone https://github.com/IcaruzSoftware/riftside-oracle.git && cd riftside-oracle
 uv venv --python 3.12 .venv          # Python 3.12 is required (pins don't install on 3.13+)
 uv pip install --python .venv/bin/python -r requirements.txt pytest
-.venv/bin/python -m pytest           # 91 tests, all must pass
+.venv/bin/python -m pytest           # 118 tests, all must pass
 ```
 
 - **Raw data is not in git.** The Oracle's Elixir CSVs (13 files, ~856 MB) are gitignored.
@@ -79,7 +79,7 @@ uv pip install --python .venv/bin/python -r requirements.txt pytest
    - `NEW_K_MULT = 2` for a player's first 20 games. Games between new and established players are therefore **not zero-sum**; documented in `elo.py`.
 6. **`train.py`:** the Optuna CV runs on the **train slice only** and minimises log loss.
 7. **Git history:** the repo contains the original upstream history (merged with `--allow-unrelated-histories`).
-8. **Drive quota: no Drive API path.** A blocked download makes the state update fail loudly. Evaluate and predict still run on the committed state, the run exits 1, and the next day's run catches up through `LOOKBACK_DAYS = 14`.
+8. **Drive quota: Drive API with the owner's key (option B, since 2026-10-17; was option A, no Drive API path).** With the GitHub secret `GOOGLE_DRIVE_API_KEY` set, `oe.py` lists and downloads through the Drive API v3 (key in the `X-Goog-Api-Key` header, never logged); without it, the public links as before. An API quota error falls back to the public link once, for the folder listing and for the download separately. The per-file download quota may still apply to API downloads, so a block stays possible: then the state update fails loudly, evaluate and predict still run on the committed state, the run exits 1, and the next day's run catches up through `LOOKBACK_DAYS = 14`.
 9. **`player_elo_recent.parquet` is committed in full every day**, with no pruning.
 10. **`academy` was removed from `lolesports._SUFFIXES`**, because academy teams are separate teams.
 11. **`RECORD_START = "2026-10-15"`** in `evaluate.py`.
@@ -159,7 +159,8 @@ Method: walk-forward validation over 3 windows (2021-07..2025-05, all before the
 
 ## Data access
 
-- **Google Drive "Quota exceeded":** on 2026-10-15 every scripted full OE download got Drive's quota page, even for the 2014 file. Small Range requests still worked. We do **not** chunk around the quota with Range requests, because that would get around Google's limit. `oe.py --check` starts a real download, so it detects the block. OE's old S3 mirror is gone (404).
+- **Google Drive "Quota exceeded":** on 2026-10-15 every scripted full OE download got Drive's quota page, even for the 2014 file. Small Range requests still worked. We do **not** chunk around the quota with Range requests, because that would get around Google's limit. `oe.py --check` says which path it uses (Drive API or public link) and starts a real download, so it detects the block. OE's old S3 mirror is gone (404).
+- **Drive API key (decision 8):** not yet verified with a real key; a bogus key gets the expected `API_KEY_INVALID` error, which confirms Drive reads the key from the `X-Goog-Api-Key` header.
 - **Daily job:** it downloads the current year's file (~78 MB) every morning. Decision 8 covers a blocked download.
 - **lolesports API:** works with the public site key and needs no proxy.
 
@@ -173,6 +174,7 @@ Owner-only (the agents can't do these):
 4. Set the CSP `frame-ancestors` header for `/card` in the server config, so it can be iframed on `gerritvisser.de`.
 5. Optional: add the card to the portfolio repo (`IcaruzSoftware/portfolio`).
 6. Check the web app against real Supabase data once it is deployed.
+7. Create a Google Drive API key and add it as the repo secret `GOOGLE_DRIVE_API_KEY` ([docs/operations.md](docs/operations.md#creating-the-drive-api-key)), then run `Check Data Sources` by hand and confirm the OE step reports `Drive API` and `OK`.
 
 Optional follow-ups (none is needed for a good record):
 
@@ -195,7 +197,7 @@ Optional follow-ups (none is needed for a good record):
   - A rare double write failure (`player_elo_current` written but `recent` not) could double-count games on the next run.
   - The evaluate `pending` select is unpaged; this only matters with more than 1000 unresolved predictions at once.
   - LCK/LPL matches between about 05:00 and 09:00 UTC are predicted on state that is missing the previous day, because OE refreshes around 07:05 UTC. This is by design.
-  - On days with the Drive quota block, the evaluate run shows as failed.
+  - On days with the Drive quota block (API and public link both blocked), the evaluate run shows as failed.
 - **Train vs live:**
   - About 1.1% of games belong to series that cross UTC midnight. In training, their later games see the earlier ones; live prediction doesn't.
   - Training uses each game's actual lineups, live the last-known lineup.

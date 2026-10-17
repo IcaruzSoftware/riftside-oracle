@@ -31,6 +31,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GOOGLE_DRIVE_API_KEY: ${{ secrets.GOOGLE_DRIVE_API_KEY }}   # optional; empty = public link
         run: python src/scripts/daily_run.py --evaluate
 
       # Also after a failed step above: if only evaluate failed, the state update

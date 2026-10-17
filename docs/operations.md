@@ -29,7 +29,10 @@ hand from the Drive folder
 into `src/data/raw/oe/`, keeping the original names (for example
 `2026_LoL_esports_match_data_from_OraclesElixir.csv`). `bootstrap_data.py`
 does the same, but Drive often blocks scripted full downloads (see
-[Drive quota](#when-a-job-fails)).
+[Drive quota](#when-a-job-fails)). To make `bootstrap_data.py` and
+`daily_state.py` use the Drive API locally, set the key in the shell first
+(`export GOOGLE_DRIVE_API_KEY=...`, PowerShell `$env:GOOGLE_DRIVE_API_KEY = "..."`);
+the per-file download quota may still block it.
 
 ## Manual commands
 
@@ -130,8 +133,31 @@ either source.
 |---|---|---|
 | `SUPABASE_URL` | `daily_predict.yml`, `daily_evaluate.yml`, `keepalive.yml` | Public project URL (`https://pdblqlbgrelyqjgkpdte.supabase.co`). |
 | `SUPABASE_KEY` | same | **Service-role key**: bypasses RLS, full read/write. Never put it in the web app. The web app uses the separate, RLS-restricted anon key via `web/.env.local` (not a GitHub secret; see [Deploying the web app](#deploying-the-web-app)). |
+| `GOOGLE_DRIVE_API_KEY` | `daily_evaluate.yml`, `check_sources.yml` | Optional. The owner's Google API key, restricted to the Drive API; `oe.py` then lists and downloads OE through the Drive API v3 (key in the `X-Goog-Api-Key` header, never logged). Unset = the public Drive links. See [Creating the Drive API key](#creating-the-drive-api-key). |
 
 There is no proxy secret: neither OE nor lolesports blocks GitHub runners.
+
+### Creating the Drive API key
+
+1. In the [Google Cloud Console](https://console.cloud.google.com/), create a
+   new project (for example `riftside-oracle`).
+2. Select the new project in the project picker at the top of the console.
+3. APIs & Services → Library → enable **Google Drive API**.
+4. APIs & Services → Credentials → **Create credentials → API key**. Copy the
+   key from the dialog that shows it.
+5. Edit the key → API restrictions → **Restrict key** → select only
+   **Google Drive API** → Save. (No application restriction: GitHub runners
+   have no fixed IP.)
+6. In the GitHub repo: Settings → Secrets and variables → Actions → New
+   repository secret `GOOGLE_DRIVE_API_KEY` with the key.
+7. Actions tab → **Check Data Sources** → **Run workflow**. The OE step should
+   print `source    Drive API (GOOGLE_DRIVE_API_KEY set)` and end with
+   `OK - OE folder and <year> download work (via the Drive API).`
+
+An API key only reads public files, which the OE folder is. Google's Drive API
+usage-limits page says standard use is free; it does not say whether the
+project needs a billing account. The per-file download quota may still apply
+to API downloads; the public-link fallback and the 14-day lookback remain.
 
 ## When a job fails
 
@@ -140,7 +166,12 @@ logs at `INFO` level with timestamps. Common causes:
 
 - **Drive quota block on the OE download.** Log: `OE download failed ...`
   from `daily_state.py` (a body that is not the OE CSV, titled for example
-  "Google Drive - Quota exceeded"). Consequences: the state is not updated, the
+  "Google Drive - Quota exceeded"). With `GOOGLE_DRIVE_API_KEY` set, a warning
+  `OE 2026: Drive API quota exceeded (HTTP 403: ...) - retrying via the public link`
+  comes first (for the listing:
+  `OE folder: Drive API quota exceeded (HTTP 429: ...) - retrying via the public folder view`);
+  the error is only raised when the public link is blocked too.
+  Consequences: the state is not updated, the
   Daily Evaluate run shows as failed, `evaluate` and `predict` still ran
   (predict on the committed state). **Do nothing**: the next day's run catches
   up, because every run rescans from 14 days (`LOOKBACK_DAYS`) before the last
@@ -150,6 +181,18 @@ logs at `INFO` level with timestamps. Common causes:
   is under 20 hours old), run `python src/pipeline/daily_state.py` and commit
   the state files. `python src/pipeline/oe.py --check` tells whether the block
   is still active.
+- **Drive API key problem.** Log: `Drive API key in GOOGLE_DRIVE_API_KEY is
+  invalid (HTTP 400: ...)` or `Drive API error (HTTP 403: ...)` (for example
+  the Drive API not enabled in the key's project, or the key restricted to
+  another API). There is no fallback for these: fix or recreate the key
+  ([Creating the Drive API key](#creating-the-drive-api-key)), or delete the
+  secret to go back to the public links. `Drive API: file not found or not
+  public` means the OE file id or its sharing changed. `Drive API: unexpected
+  HTTP 3xx redirect to <host> (not followed)` means Drive redirected to a host
+  other than https `*.googleusercontent.com` / `*.googleapis.com`, without a
+  `Location`, or a second time; the key was not sent there. There is no
+  fallback: check whether Drive changed its download flow, or delete the
+  secret to go back to the public links.
 - **Unmapped team.** Log: `unmapped team <code>/<name>` (and `unmapped team,
   skipped` for the match); the match gets no prediction. Add a row to
   `src/pipeline/team_aliases.csv`:
@@ -206,7 +249,7 @@ gh workflow enable keepalive.yml      --repo IcaruzSoftware/riftside-oracle
 ## Checking the sources
 
 ```bash
-python src/pipeline/oe.py --check          # lists the Drive folder, starts a real download of the latest year, prints status / size / latency
+python src/pipeline/oe.py --check          # says Drive API vs public link, lists the Drive folder, starts a real download of the latest year, prints status / size / latency
 python src/pipeline/lolesports.py --check  # getLeagues; requires lck, lpl, lec, worlds
 ```
 
@@ -335,7 +378,8 @@ sharing `web/.next` with `npm run build`: delete `web/.next`.
 ## Season rollover
 
 Nothing to run manually. OE publishes a new year file with a new Drive id each
-January; `oe.list_files()` resolves ids from the folder view on every run, and
+January; `oe.list_files()` resolves ids from the Drive API listing (with a
+key) or the folder view on every run, and
 `daily_state.py` reads both the previous and the current year file in early
 January.
 

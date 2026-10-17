@@ -4,12 +4,17 @@ one file per year in a public Google Drive folder, refreshed once a day.
 
 Endpoints
 ---------
+  With GOOGLE_DRIVE_API_KEY set (Drive API v3, key sent in the X-Goog-Api-Key header):
+  folder list  https://www.googleapis.com/drive/v3/files?q='{FOLDER_ID}' in parents and trashed=false
+  download     https://www.googleapis.com/drive/v3/files/{file_id}?alt=media
+  Without it (public links, no auth):
   folder view  https://drive.google.com/embeddedfolderview?id={FOLDER_ID}
   download     https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t
 
-File IDs are resolved from the folder view on every run (a new year means a new
-ID). The download endpoint needs no auth. Drive can refuse full downloads with
-a "Quota exceeded" page for up to 24 h; --check detects that.
+File IDs are resolved from the folder on every run (a new year means a new ID).
+Drive can refuse public full downloads with a "Quota exceeded" page for up to
+24 h. An API quota error (listing or download) falls back to the public link
+once. --check detects both.
 
 Files land in src/data/raw/oe/ (gitignored). load_year() reads one year into the
 NEEDED_COLS subset with normalised dtypes; player_rows()/team_rows() split it.
@@ -20,6 +25,7 @@ import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pandas as pd
 import requests
@@ -32,6 +38,12 @@ OE_DIR = RAW_DIR / "oe"
 FOLDER_ID = "1gLSw0RLjBbtaNy0dgnGQDAZOHIgCe-HH"
 FOLDER_URL = f"https://drive.google.com/embeddedfolderview?id={FOLDER_ID}"
 DOWNLOAD_URL = "https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+API_FILES_URL = "https://www.googleapis.com/drive/v3/files"
+API_KEY_ENV = "GOOGLE_DRIVE_API_KEY"
+_QUOTA_REASONS = {"downloadQuotaExceeded", "quotaExceeded", "rateLimitExceeded",
+                  "userRateLimitExceeded", "dailyLimitExceeded", "RATE_LIMIT_EXCEEDED"}
+_KEY_REASONS = {"keyInvalid", "API_KEY_INVALID"}
+_REDIRECT_HOSTS = (".googleusercontent.com", ".googleapis.com")   # https only, followed once
 
 _TIMEOUT = 30
 MAX_AGE_HOURS = 20          # OE refreshes once a day; younger local files are reused
@@ -66,6 +78,66 @@ _ENTRY_RE = re.compile(
     r'flip-entry-title">(\d{4})_LoL_esports_match_data_from_OraclesElixir\.csv<',
     re.DOTALL,
 )
+_NAME_RE = re.compile(r"(\d{4})_LoL_esports_match_data_from_OraclesElixir\.csv")
+
+
+class DriveQuotaError(RuntimeError):
+    """The Drive API refused the request for quota / rate-limit reasons."""
+
+
+def api_key() -> str | None:
+    """The Drive API key from GOOGLE_DRIVE_API_KEY; unset, empty or blank means no key."""
+    return (os.environ.get(API_KEY_ENV) or "").strip() or None
+
+
+def _is_redirect(resp: requests.Response) -> bool:
+    return 300 <= resp.status_code < 400
+
+
+def _api_get(url: str, key: str, **kwargs) -> requests.Response:
+    """
+    GET a Drive API URL. The key goes only in a header, never in a URL (so not in
+    exception texts or logs). One redirect to an https *.googleusercontent.com /
+    *.googleapis.com host is followed with a plain request without the key; any
+    other redirect is left for _raise_for_api to reject.
+    """
+    resp = requests.get(url, headers={"X-Goog-Api-Key": key}, timeout=_TIMEOUT,
+                        allow_redirects=False, **kwargs)
+    location = resp.headers.get("Location", "") if _is_redirect(resp) else ""
+    target = urlsplit(location)
+    if target.scheme == "https" and (target.hostname or "").endswith(_REDIRECT_HOSTS):
+        resp.close()
+        resp = requests.get(location, timeout=_TIMEOUT, allow_redirects=False,
+                            stream=kwargs.get("stream", False))
+    return resp
+
+
+def _raise_for_api(resp: requests.Response) -> None:
+    """Raise a clear error for a failed Drive API response (quota, bad key, not found)."""
+    if _is_redirect(resp):
+        host = urlsplit(resp.headers.get("Location", "")).hostname or "?"
+        raise RuntimeError(f"Drive API: unexpected HTTP {resp.status_code} redirect to {host} "
+                           f"(not followed)")
+    if resp.ok:
+        return
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    err = body.get("error") if isinstance(body, dict) else None
+    err = err if isinstance(err, dict) else {}
+    items = [i for k in ("errors", "details") if isinstance(err.get(k), list) for i in err[k]]
+    reasons = {i.get("reason") for i in items if isinstance(i, dict)}
+    message = err["message"] if isinstance(err.get("message"), str) else str(resp.reason)
+    detail = f"HTTP {resp.status_code}: {message}"
+    if (resp.status_code == 429 or err.get("status") == "RESOURCE_EXHAUSTED"
+            or reasons & _QUOTA_REASONS):
+        raise DriveQuotaError(f"Drive API quota exceeded ({detail})")
+    if reasons & _KEY_REASONS or "API key not valid" in message:
+        raise RuntimeError(f"Drive API key in {API_KEY_ENV} is invalid ({detail})")
+    if resp.status_code == 404:
+        raise RuntimeError(f"Drive API: file not found or not public ({detail})")
+    raise RuntimeError(f"Drive API error ({detail})")
 
 
 def parse_folder(html: str) -> dict[int, str]:
@@ -73,8 +145,33 @@ def parse_folder(html: str) -> dict[int, str]:
     return {int(year): file_id for file_id, year in _ENTRY_RE.findall(html)}
 
 
+def parse_listing(files: list[dict]) -> dict[int, str]:
+    """Year -> Drive file id from a Drive API files.list `files` array."""
+    return {int(m[1]): f["id"] for f in files if (m := _NAME_RE.fullmatch(f["name"]))}
+
+
+def _list_files_api(key: str) -> dict[int, str]:
+    resp = _api_get(API_FILES_URL, key, params={
+        "q": f"'{FOLDER_ID}' in parents and trashed=false", "fields": "files(id,name)",
+        "pageSize": 1000, "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"})
+    _raise_for_api(resp)
+    files = parse_listing(resp.json().get("files", []))
+    if not files:
+        raise RuntimeError(f"OE folder {FOLDER_ID}: Drive API listing returned no OE files")
+    return files
+
+
 def list_files() -> dict[int, str]:
-    """Fetch the folder view and return year -> file id. Raises if nothing matched."""
+    """
+    Return year -> file id: via the Drive API files.list with a key (one retry via
+    the folder view on an API quota error), else from the embedded folder view.
+    Raises if nothing matched.
+    """
+    if key := api_key():
+        try:
+            return _list_files_api(key)
+        except DriveQuotaError as exc:
+            logger.warning("OE folder: %s - retrying via the public folder view", exc)
     resp = requests.get(FOLDER_URL, timeout=_TIMEOUT)
     resp.raise_for_status()
     files = parse_folder(resp.text)
@@ -87,12 +184,21 @@ def year_path(year: int, oe_dir: Path = OE_DIR) -> Path:
     return oe_dir / f"{year}_LoL_esports_match_data_from_OraclesElixir.csv"
 
 
+def _open_download(file_id: str, key: str | None) -> requests.Response:
+    """Streaming full GET of a file: Drive API with a key, else the public link."""
+    if key:
+        return _api_get(f"{API_FILES_URL}/{file_id}", key, params={"alt": "media"}, stream=True)
+    return requests.get(DOWNLOAD_URL.format(file_id=file_id), stream=True, timeout=_TIMEOUT)
+
+
 def download_year(year: int, dest: Path = OE_DIR, file_id: str | None = None,
                   force: bool = False) -> Path:
     """
     Download one year's CSV into dest (atomic: temp file + os.replace) and return
     its path. Skips the download if the local file is younger than MAX_AGE_HOURS,
-    unless force. Raises if Drive returns anything but the OE CSV.
+    unless force. Uses the Drive API when a key is set and falls back to the
+    public link once on an API quota error. Raises if Drive returns anything but
+    the OE CSV.
     """
     path = year_path(year, dest)
     if not force and path.exists() and time.time() - path.stat().st_mtime < MAX_AGE_HOURS * 3600:
@@ -102,12 +208,27 @@ def download_year(year: int, dest: Path = OE_DIR, file_id: str | None = None,
         file_id = list_files()[year]
 
     dest.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".part")
     t0 = time.monotonic()
+    key = api_key()
     try:
-        with requests.get(DOWNLOAD_URL.format(file_id=file_id), stream=True,
-                          timeout=_TIMEOUT) as resp:
-            resp.raise_for_status()
+        _download(year, file_id, path, key)
+    except DriveQuotaError as exc:
+        logger.warning("OE %d: %s - retrying via the public link", year, exc)
+        key = None
+        _download(year, file_id, path, key)
+    logger.info("OE %d: downloaded %s B in %.1fs via the %s", year, f"{path.stat().st_size:,}",
+                time.monotonic() - t0, "Drive API" if key else "public link")
+    return path
+
+
+def _download(year: int, file_id: str, path: Path, key: str | None) -> None:
+    tmp = path.with_name(path.name + ".part")
+    try:
+        with _open_download(file_id, key) as resp:
+            if key:
+                _raise_for_api(resp)
+            else:
+                resp.raise_for_status()
             with open(tmp, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=1 << 20):
                     f.write(chunk)
@@ -121,9 +242,6 @@ def download_year(year: int, dest: Path = OE_DIR, file_id: str | None = None,
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
-    logger.info("OE %d: downloaded %s B in %.1fs", year, f"{path.stat().st_size:,}",
-                time.monotonic() - t0)
-    return path
 
 
 def load_year(year: int, oe_dir: Path = OE_DIR) -> pd.DataFrame:
@@ -169,13 +287,46 @@ def team_rows(df: pd.DataFrame) -> pd.DataFrame:
 # Connectivity check (CLI)
 # ---------------------------------------------------------------------------
 
+def _check_download(year: int, file_id: str, key: str | None) -> str | None:
+    """
+    Start a full download, read only its first 20 KB and print one status line.
+    Returns None if the body is the OE CSV, else why not. Raises DriveQuotaError
+    on a Drive API quota error.
+    """
+    t0 = time.monotonic()
+    try:
+        # stream + bounded read: only the first 20 KB of the full download is pulled.
+        with _open_download(file_id, key) as resp:
+            if key:
+                _raise_for_api(resp)
+            body = next(resp.iter_content(chunk_size=20480), b"")
+    except DriveQuotaError:
+        raise
+    except (requests.exceptions.RequestException, RuntimeError) as exc:
+        print(f"download  {type(exc).__name__}: {exc}  {time.monotonic() - t0:5.2f}s")
+        return f"could not download the {year} file"
+    print(f"download  {year} HTTP {resp.status_code}  {len(body):,} B  "
+          f"{time.monotonic() - t0:5.2f}s  total {resp.headers.get('Content-Length', '?')} B  "
+          f"last-modified {resp.headers.get('Last-Modified', '?')}")
+    if resp.status_code in (200, 206) and body.startswith(b"gameid,"):
+        return None
+    title = re.search(rb"<title>(.*?)</title>", body)
+    return (f"{year} download did not return the OE CSV"
+            f"{': ' + title[1].decode(errors='replace') if title else ''}")
+
+
 def check() -> int:
     """
-    List the folder, then start a full (non-Range) download of the latest year's CSV,
-    read only its first 20 KB and print status / size / latency. Returns 0 if both
-    work and the body is the OE CSV, else 1. A Range request would hide Drive's
-    "Quota exceeded" page, which only blocks full downloads.
+    Say which path is used (Drive API with GOOGLE_DRIVE_API_KEY, else the public
+    link), list the folder, then start a full (non-Range) download of the latest
+    year's CSV, read only its first 20 KB and print status / size / latency. An API
+    quota error retries via the public link, as download_year does. Returns 0 if
+    both work and the body is the OE CSV, else 1. A Range request would hide
+    Drive's "Quota exceeded" page, which only blocks full downloads.
     """
+    key = api_key()
+    via = "Drive API" if key else "public link"
+    print(f"source    {via} ({API_KEY_ENV} {'set' if key else 'not set'})")
     t0 = time.monotonic()
     try:
         files = list_files()
@@ -187,26 +338,15 @@ def check() -> int:
           f"{time.monotonic() - t0:5.2f}s")
 
     year = max(files)
-    t0 = time.monotonic()
     try:
-        # stream + bounded read: only the first 20 KB of the full download is pulled.
-        with requests.get(DOWNLOAD_URL.format(file_id=files[year]), stream=True,
-                          timeout=_TIMEOUT) as resp:
-            body = next(resp.iter_content(chunk_size=20480), b"")
-    except requests.exceptions.RequestException as exc:
-        print(f"download  {type(exc).__name__}: {exc}  {time.monotonic() - t0:5.2f}s")
-        print(f"FAILED - could not download the {year} file.")
-        return 1
-    title = re.search(rb"<title>(.*?)</title>", body)
-    print(f"download  {year} HTTP {resp.status_code}  {len(body):,} B  "
-          f"{time.monotonic() - t0:5.2f}s  total {resp.headers.get('Content-Length', '?')} B  "
-          f"last-modified {resp.headers.get('Last-Modified', '?')}")
-
-    ok = resp.status_code in (200, 206) and body.startswith(b"gameid,")
-    print(f"OK - OE folder and {year} download work." if ok
-          else f"FAILED - {year} download did not return the OE CSV"
-               f"{': ' + title[1].decode(errors='replace') if title else ''}.")
-    return 0 if ok else 1
+        err = _check_download(year, files[year], key)
+    except DriveQuotaError as exc:
+        print(f"download  {exc} - retrying via the public link")
+        via = "public link"
+        err = _check_download(year, files[year], None)
+    print(f"OK - OE folder and {year} download work (via the {via})." if err is None
+          else f"FAILED - {err}.")
+    return 0 if err is None else 1
 
 
 if __name__ == "__main__":

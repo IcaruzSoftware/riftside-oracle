@@ -83,8 +83,11 @@ first to ⌈n/2⌉ with independent games). The public record counts **series**.
 **`src/pipeline/`**
 
 - `oe.py` — Oracle's Elixir client. `list_files()` resolves year → Drive file
-  id by parsing the public embedded folder view (a new year means a new id, so
-  nothing is hardcoded). `download_year()` is atomic (temp file +
+  id via the Drive API `files.list` when `GOOGLE_DRIVE_API_KEY` is set (one
+  folder-view retry on an API quota error), else by
+  parsing the public embedded folder view (a new year means a new id, so
+  nothing is hardcoded). `download_year()` uses the Drive API with a key (one
+  public-link retry on an API quota error), else the public link; it is atomic (temp file +
   `os.replace`), reuses a local file younger than `MAX_AGE_HOURS = 20`, and
   raises if Drive answers with anything but the CSV (the "Quota exceeded"
   page). `load_year()` reads one year into the 43 columns of `NEEDED_COLS`
