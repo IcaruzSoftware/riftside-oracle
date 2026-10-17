@@ -80,7 +80,7 @@ Python **3.12** (matches CI; the pins don't install on 3.13+). Use a local
 
 ```bash
 pip install -r requirements.txt pytest                    # pytest is not in requirements.txt
-python -m pytest                                           # 118 tests, via pytest.ini
+python -m pytest                                           # 121 tests, via pytest.ini
 python src/scripts/daily_run.py                             # evaluate + state update + predict (UTC date)
 python src/scripts/daily_run.py --predict --dry-run         # print predictions, write nothing
 python src/scripts/daily_run.py --evaluate --dry-run
