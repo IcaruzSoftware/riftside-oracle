@@ -29,7 +29,7 @@ import pandas as pd
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from pipeline import oe
+from pipeline import elo, oe
 from pipeline.features import build_feature_matrix
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -66,6 +66,18 @@ def build_game_index(team_games: pd.DataFrame) -> pd.DataFrame:
     return index.sort_values(["game_date", "game_id"], kind="stable").reset_index(drop=True)
 
 
+def check_elo_history(games: pd.DataFrame) -> None:
+    """Raise if elo.HISTORY_PATH is missing or ends before the last game (features would use future ELO)."""
+    if not elo.HISTORY_PATH.exists():
+        raise FileNotFoundError(f"No ELO history at {elo.HISTORY_PATH} - run python src/pipeline/elo.py --force first")
+    # Dates, not gameid sets: incomplete games / missing playerids legitimately have no ELO rows.
+    hist_end = pd.read_parquet(elo.HISTORY_PATH, columns=["game_date"])["game_date"].max().normalize()
+    games_end = games["game_date"].max().normalize()
+    if not hist_end >= games_end:                           # also catches an empty history (NaT)
+        raise RuntimeError(f"ELO history is stale: player_elo.parquet ends {hist_end.date()}, "
+                           f"games run to {games_end.date()} -run python src/pipeline/elo.py --force first")
+
+
 def build_dataset(force: bool = False) -> pd.DataFrame:
     """Build (or load) the feature matrix and save it to OUT_PATH."""
     if OUT_PATH.exists() and not force:
@@ -78,6 +90,7 @@ def build_dataset(force: bool = False) -> pd.DataFrame:
     logger.info("%d games since %s; skipping %d with a missing teamid",
                 len(games), START_DATE, int(no_team.sum()))
     games = games[~no_team]
+    check_elo_history(games)
 
     rows = []
     for m in tqdm(games.itertuples(index=False), total=len(games),

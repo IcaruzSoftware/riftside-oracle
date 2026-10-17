@@ -133,6 +133,7 @@ def _player(g: "_Game", pid) -> tuple[np.ndarray | None, int]:
     if s is None:
         return None, 0
     i = int(np.searchsorted(s[0], g.day))
+    # cur fallback = no later snapshot; build_dataset.check_elo_history guards against a stale history
     return (s[1][i] if i < len(s[0]) else g.st["cur"][pid][0]), i
 
 

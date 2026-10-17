@@ -6,7 +6,7 @@ the status and decision log; CLAUDE.md is the working guide; `docs/` has the dep
 ## TL;DR
 
 - **Phases 0–6 are done** (data layer, ELO, features and training, daily pipeline, web app, docs), plus one model-improvement round. Each phase is committed and was reviewed by two independent reviewers.
-- **The daily pipeline is live** since 2026-10-16 (see "Live setup"). 118 tests, all passing.
+- **The daily pipeline is live** since 2026-10-16 (see "Live setup"). 121 tests, all passing.
 - **The web app is built but not deployed** and not yet checked against real Supabase data (no anon key locally).
 - **Next steps are owner-only** (see "Next steps"): `web/.env.local`, the Plesk subdomain, the build and upload, the CSP `frame-ancestors` header.
 - **Model quality, at the level that matters (who wins the series):**
@@ -20,7 +20,7 @@ the status and decision log; CLAUDE.md is the working guide; `docs/` has the dep
 git clone https://github.com/IcaruzSoftware/riftside-oracle.git && cd riftside-oracle
 uv venv --python 3.12 .venv          # Python 3.12 is required (pins don't install on 3.13+)
 uv pip install --python .venv/bin/python -r requirements.txt pytest
-.venv/bin/python -m pytest           # 118 tests, all must pass
+.venv/bin/python -m pytest           # 121 tests, all must pass
 ```
 
 - **Raw data is not in git.** The Oracle's Elixir CSVs (13 files, ~856 MB) are gitignored.
