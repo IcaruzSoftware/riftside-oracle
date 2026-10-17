@@ -86,8 +86,10 @@ first to ⌈n/2⌉ with independent games). The public record counts **series**.
   id via the Drive API `files.list` when `GOOGLE_DRIVE_API_KEY` is set (one
   folder-view retry on an API quota error), else by
   parsing the public embedded folder view (a new year means a new id, so
-  nothing is hardcoded). `download_year()` uses the Drive API with a key (one
-  public-link retry on an API quota error), else the public link; it is atomic (temp file +
+  nothing is hardcoded). `download_year()` follows `route_order()`: with a key
+  the Drive API, on an API quota error a temporary copy in the owner's Drive
+  (when the `GOOGLE_OAUTH_*` secrets are set), then the public link; without a
+  key the public link, then the copy; it is atomic (temp file +
   `os.replace`), reuses a local file younger than `MAX_AGE_HOURS = 20`, and
   raises if Drive answers with anything but the CSV (the "Quota exceeded"
   page). `load_year()` reads one year into the 43 columns of `NEEDED_COLS`

@@ -213,16 +213,40 @@ row when `resolve_team` logs an unmapped team (see
   error fails with its own message and no fallback. Drive can answer scripted public full downloads
   with a "Quota exceeded" page for up to 24 hours (it did on 2026-10-15, even
   for the 2014 file, while small Range requests still worked). The per-file
-  download quota may also apply to API downloads, so the key makes a block less
-  likely but not impossible. We do **not** chunk around the quota with Range
+  download quota also applies to API downloads (confirmed on 2026-10-17:
+  `The download quota for this file has been exceeded.`). Therefore, with
+  `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` and
+  `GOOGLE_OAUTH_REFRESH_TOKEN` all set (stripped, non-blank; a partial set is
+  off and logs a warning naming the missing vars), the download also has a
+  **copy in the owner's Drive** route (`oe.route_order`): with the key, Drive
+  API → (API quota error) copy → public link; without the key, public link →
+  copy. The copy route is a refresh-token grant at
+  `https://oauth2.googleapis.com/token` (secrets only in the POST body); a
+  sweep of leftover copies (`files.list` with `appProperties has {
+  key='riftsideOracleTmp' and value='1' } and 'me' in owners and
+  trashed=false`, then a permanent delete only of files that also have exactly
+  the name `riftside-oracle tmp OE <year>` and are older than 2 h, so a
+  concurrent run's copy is spared); `files.copy` (`supportsAllDrives=true`,
+  name `riftside-oracle tmp OE <year>`, `parents: ["root"]` so it lands in My
+  Drive, `appProperties` `riftsideOracleTmp=1`); an `alt=media` download of
+  the copy with `Authorization: Bearer` (one redirect followed without the
+  header); and `files.delete` of the copy in a `finally` (a failed delete only
+  warns with the copy's id). A copy is a new file, so it is expected to have
+  its own quota, and copying is not a download; this is not yet verified with
+  a real run. It needs the full `drive` scope, because `drive.file` cannot
+  read the public OE file. Any copy-route failure (`invalid_grant` and
+  malformed Drive responses included; the token is never retried) moves on to
+  the next route; if the last one fails, the error names the routes tried. We do **not** chunk around the quota with Range
   requests, because that would circumvent Google's limit. OE's old
   S3 mirror is gone. A blocked download is a loud failure: `daily_state.py`
   raises, the state stays as committed, `evaluate` and `predict` still run on
   the committed state, the job exits non-zero, and the next day's run catches
   up through `LOOKBACK_DAYS = 14`. A full historical download is therefore
   best done by hand from the Drive folder in a browser. `oe.py --check` says
-  which path it uses (Drive API or public link) and starts a real (non-Range)
-  download, so it detects the block.
+  which path it uses (Drive API or public link) and whether the copy route is
+  configured (and tests its token), starts a real (non-Range) download along
+  the same routes, so it detects the block, and names the route that
+  delivered the file.
 - **lolesports API**: works from GitHub-hosted runners and from a home PC with
   the public key. No proxy is needed or used (`check_sources.yml` passed on a
   GitHub runner).

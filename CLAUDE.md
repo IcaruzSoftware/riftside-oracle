@@ -62,6 +62,7 @@ src/pipeline/
 src/scripts/
   bootstrap_data.py   download every OE year file into src/data/raw/oe/
   daily_run.py        GitHub Actions entry point: --predict / --evaluate / both
+  google_oauth_token.py  one-off local helper: prints the OAuth refresh token for the copy-to-Drive fallback
 src/supabase/
   schema.sql          tables (predictions, shap_values, running_record), RLS, explicit GRANTs; run once in the SQL editor
 .github/workflows/
@@ -80,7 +81,7 @@ Python **3.12** (matches CI; the pins don't install on 3.13+). Use a local
 
 ```bash
 pip install -r requirements.txt pytest                    # pytest is not in requirements.txt
-python -m pytest                                           # 121 tests, via pytest.ini
+python -m pytest                                           # 168 tests, via pytest.ini
 python src/scripts/daily_run.py                             # evaluate + state update + predict (UTC date)
 python src/scripts/daily_run.py --predict --dry-run         # print predictions, write nothing
 python src/scripts/daily_run.py --evaluate --dry-run
@@ -139,9 +140,25 @@ history) and `feature_matrix.parquet`. File-by-file table:
   in the shell to use the API for `bootstrap_data.py` / `daily_state.py`. An
   API quota error (403 quota reasons, 429, `RESOURCE_EXHAUSTED`) falls back to
   the public link once, for the listing and the download separately.
+- **Copy-to-own-Drive fallback (OAuth):** with `GOOGLE_OAUTH_CLIENT_ID`,
+  `GOOGLE_OAUTH_CLIENT_SECRET` and `GOOGLE_OAUTH_REFRESH_TOKEN` all non-blank,
+  the **download** gets a copy-in-the-owner's-Drive route (`oe.route_order`):
+  with the key, Drive API → (API quota error) copy → public link; without the
+  key, public link → copy. The copy route: refresh-token grant → sweep our
+  own leftover copies (tagged `appProperties` `riftsideOracleTmp=1`, exact
+  name `riftside-oracle tmp OE <year>`, older than 2 h) → `files.copy`
+  (`parents: ["root"]`, tagged) → download the copy with a Bearer token →
+  delete it in a `finally`. That a copy has its own quota is expected, not yet
+  verified. Any copy-route failure (also `invalid_grant`, never retried, and
+  malformed Drive responses) moves on to the next route; a failed delete only
+  warns. Partial set = off, with a warning naming the missing vars. Needs
+  the full `drive` scope (`drive.file` can't read the public OE file). The
+  secrets go only in the POST body / `Authorization` header (never in a URL,
+  exception or log; the header is not sent on a redirect). Token helper:
+  `src/scripts/google_oauth_token.py`.
 - **Drive quota:** on 2026-10-15 every scripted full download got Drive's
-  "Quota exceeded" page. The per-file download quota may still apply to API
-  downloads. Do **not** chunk around it with Range requests. A
+  "Quota exceeded" page; on 2026-10-17 the per-file quota blocked the API
+  download too. Do **not** chunk around it with Range requests. A
   blocked download makes the state update fail loudly (the run exits 1), but
   evaluate and predict still run on the committed state, and the next day's
   run catches up through `LOOKBACK_DAYS = 14`. For a local rebuild, download
@@ -206,6 +223,14 @@ history) and `feature_matrix.parquet`. File-by-file table:
   Drive API) in the GitHub secret `GOOGLE_DRIVE_API_KEY`, passed to
   `daily_evaluate.yml` and `check_sources.yml`; optional (empty = public links).
   How to create it: [docs/operations.md](docs/operations.md#creating-the-drive-api-key).
+- **Google OAuth client** ("Desktop app", same Cloud project, consent screen
+  External + In production, `drive` scope) in the GitHub secrets
+  `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
+  `GOOGLE_OAUTH_REFRESH_TOKEN`, passed to the same two workflows; optional
+  (empty = no copy fallback), works with or without the API key. The token is
+  only used on quota days and by `--check`, so run Check Data Sources every
+  couple of months (6-month inactivity expiry). Setup:
+  [docs/operations.md](docs/operations.md#setting-up-the-copy-to-drive-fallback-oauth).
 - **The owner's Plesk server** (nginx) is meant to serve the static export (not
   deployed yet). No auto-deploy — see
   [docs/operations.md](docs/operations.md#deploying-the-web-app). For `/card`

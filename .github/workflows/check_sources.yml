@@ -24,6 +24,10 @@ jobs:
       - name: Check Oracle's Elixir
         env:
           GOOGLE_DRIVE_API_KEY: ${{ secrets.GOOGLE_DRIVE_API_KEY }}   # optional; empty = public link
+          # optional, all three or none; empty = no copy-to-own-Drive fallback
+          GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+          GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
         run: python src/pipeline/oe.py --check
 
       - name: Check lolesports API

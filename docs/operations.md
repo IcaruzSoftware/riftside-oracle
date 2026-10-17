@@ -134,6 +134,7 @@ either source.
 | `SUPABASE_URL` | `daily_predict.yml`, `daily_evaluate.yml`, `keepalive.yml` | Public project URL (`https://pdblqlbgrelyqjgkpdte.supabase.co`). |
 | `SUPABASE_KEY` | same | **Service-role key**: bypasses RLS, full read/write. Never put it in the web app. The web app uses the separate, RLS-restricted anon key via `web/.env.local` (not a GitHub secret; see [Deploying the web app](#deploying-the-web-app)). |
 | `GOOGLE_DRIVE_API_KEY` | `daily_evaluate.yml`, `check_sources.yml` | Optional. The owner's Google API key, restricted to the Drive API; `oe.py` then lists and downloads OE through the Drive API v3 (key in the `X-Goog-Api-Key` header, never logged). Unset = the public Drive links. See [Creating the Drive API key](#creating-the-drive-api-key). |
+| `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REFRESH_TOKEN` | `daily_evaluate.yml`, `check_sources.yml` | Optional, all three or none (a partial set is off, with a warning naming the missing ones). The owner's OAuth "Desktop app" client and a refresh token for the `drive` scope; when a download route is blocked (with the key: after an API quota error, before the public link; without it: after the public link), `oe.py` copies the OE file into the owner's Drive, downloads the copy and deletes it. Works with or without `GOOGLE_DRIVE_API_KEY`. Never logged. See [Setting up the copy-to-Drive fallback (OAuth)](#setting-up-the-copy-to-drive-fallback-oauth). |
 
 There is no proxy secret: neither OE nor lolesports blocks GitHub runners.
 
@@ -159,6 +160,126 @@ usage-limits page says standard use is free; it does not say whether the
 project needs a billing account. The per-file download quota may still apply
 to API downloads; the public-link fallback and the 14-day lookback remain.
 
+### Setting up the copy-to-Drive fallback (OAuth)
+
+**Why.** Drive's download quota is per file. On 2026-10-17 it blocked the OE
+file for the Drive API as well as for the public link. A **copy** of the file
+in your own Drive is a new file, so it is expected to have its own quota, and
+copying is not a download (expected, not yet verified with a real run). When
+a download route is blocked, `oe.py` copies the OE file into your My Drive
+(named `riftside-oracle tmp OE <year>`, tagged with a private app property),
+downloads the copy and deletes it straight away (permanently, not into the
+bin). An API key cannot do this: copying needs your Google account, through
+OAuth.
+
+**Route order.** With the API key (`GOOGLE_DRIVE_API_KEY`): Drive API → on an
+API quota error the copy → the public link. Without the key: the public link
+→ the copy. The copy route works with or without the key; the key only adds
+the Drive API as the first route. Any copy-route failure moves on to the next
+route, and if every route fails the error lists the routes tried.
+
+**Why the full `drive` scope.** The narrower `drive.file` scope only reaches
+files the app created or you opened with it. It cannot read the public OE
+file, so the copy would fail. `.../auth/drive` lets the app see and change
+everything in your Drive. The code only deletes its own copies: a file must
+carry the app's tag, have exactly the name `riftside-oracle tmp OE <year>`
+and be older than 2 hours (or be the copy the same run just made). It is a
+Google "restricted" scope, so the consent screen shows a "Google hasn't
+verified this app" warning (see step 7).
+
+Do this in the **same Google Cloud project as the API key**; the Google Drive
+API is already enabled there. German console labels are given in brackets;
+the ones marked *(unconfirmed)* were not checked against Google's German docs.
+
+1. Select the project in the project picker at the top of the
+   [Google Cloud Console](https://console.cloud.google.com/).
+2. Menu → **Google Auth Platform** → **Branding**. If it says the platform is
+   not configured yet, click **Get started** [**Jetzt starten**]:
+   - App information [**Anwendungsinformationen**]: App name
+     [**Anwendungsname**] `riftside-oracle`; User support email: your
+     address → Next.
+   - Audience [**Zielgruppe**]: **External** [**Extern**] → Next.
+   - Contact information [**Kontaktdaten**]: your address → Next.
+   - Finish [**Abschließen**]: agree to the Google API Services User Data
+     Policy → Continue → **Create** [**Erstellen**].
+3. **Data Access** [**Datenzugriff**] → **Add or remove scopes** [**Bereiche
+   hinzufügen oder entfernen**]. Tick `https://www.googleapis.com/auth/drive`
+   (Google Drive API, "See, edit, create and delete all of your Google Drive
+   files"; if it is not in the list, paste it under "Manually add scopes" →
+   Add to table) → Update → Save.
+4. Optional: **Audience** [**Zielgruppe**] → Test users [**Testnutzer**] →
+   **Add users** [**Nutzer hinzufügen**] → your own Google address → Save
+   [**Speichern**]. Test users only matter while the app is in "Testing";
+   once it is in production (step 5) they are not needed.
+5. Still on **Audience** [**Zielgruppe**]: Publishing status → **Publish app**
+   [**App veröffentlichen**, *(unconfirmed)*] → Confirm, so the status is
+   **In production** [**In Produktion**, *(unconfirmed)*]. This matters: while
+   an External app is in "Testing", Google issues refresh tokens that expire
+   after 7 days. In production, without Google's verification, the app works
+   for you: Google lets apps for personal use (fewer than 100 users) skip
+   verification, and their users may click through the "unverified app"
+   warning at sign-in. No verification is needed for this.
+   **If "Publish app" is greyed out:** go back to **Branding** and fill in an
+   application home page (for example `https://gerritvisser.de`), a privacy
+   policy link (a page on that site) and add `gerritvisser.de` under
+   authorised domains, save, then publish.
+6. **Clients** → **Create client** [**Client erstellen**, *(unconfirmed)*] →
+   Application type [**Anwendungstyp**, *(unconfirmed)*] **Desktop app**
+   [**Desktop-App**, *(unconfirmed)*] → name `riftside-oracle` → Create. Copy
+   the **Client ID** and **Client secret** from the dialog right away
+   (download the JSON if offered; the console may not show the secret again).
+7. Run the helper locally, **after** step 5 (a token issued while the app was
+   in "Testing" still expires after 7 days). PowerShell, from the repo root,
+   with the secret in environment variables rather than on the command line
+   (so it does not land in the shell history):
+
+   ```powershell
+   $env:GOOGLE_OAUTH_CLIENT_ID = "..."; $env:GOOGLE_OAUTH_CLIENT_SECRET = "..."; .venv\Scripts\python.exe src\scripts\google_oauth_token.py
+   ```
+
+   bash: `GOOGLE_OAUTH_CLIENT_ID=... GOOGLE_OAUTH_CLIENT_SECRET=... .venv/bin/python src/scripts/google_oauth_token.py`.
+   `--client-id` / `--client-secret` also work, but the secret then lands in
+   the shell history.
+
+   It opens the consent page in your browser. Sign in; on "Google hasn't
+   verified this app" [**Google hat diese App nicht überprüft**,
+   *(unconfirmed)*] click **Advanced** [**Erweitert**, *(unconfirmed)*] →
+   **Go to riftside-oracle (unsafe)** [**Zu riftside-oracle wechseln
+   (unsicher)**, *(unconfirmed)*], then allow Drive access (tick the Drive
+   checkbox if one is shown). The helper waits up to 5 minutes and prints only
+   the refresh token. If it says Drive access was not granted, run it again
+   and tick the checkbox.
+8. GitHub repo → Settings → Secrets and variables → Actions → add three
+   repository secrets: `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
+   `GOOGLE_OAUTH_REFRESH_TOKEN`.
+9. Actions tab → **Check Data Sources** → **Run workflow**. The OE step should
+   print `copy      configured (GOOGLE_OAUTH_* set), access token OK` and the
+   effective order:
+   - with the API key: `routes    the Drive API -> a copy in your Drive -> the public link`,
+     ending with `OK - ... (via the Drive API)`, or `(via a copy in your Drive)`
+     on a quota day;
+   - without the key: `routes    the public link -> a copy in your Drive`,
+     ending with `OK - ... (via the public link)`, or `(via a copy in your Drive)`
+     while the public link is blocked.
+
+**Keep it alive.** The token is only used on quota days and by `--check`.
+Google expires a refresh token that goes unused for six months and may delete
+an OAuth client that has been inactive for six months. Run **Check Data
+Sources** by hand every couple of months; it requests a token each time.
+
+**Leftovers and concurrent runs.** If a run crashes between copy and delete,
+the copy (~78 MB) uses your Drive storage until a later copy run sweeps it or
+you delete it by hand. Only copies older than 2 hours are swept, so a run going
+on at the same time (for example Daily Evaluate and Check Data Sources) keeps
+its copy.
+
+To use the fallback locally, set the three variables in the shell like the API
+key. Without them, nothing changes. Sources for step 5 and the 7-day rule:
+Google's [OAuth 2.0 overview](https://developers.google.com/identity/protocols/oauth2#expiration),
+[Unverified apps](https://support.google.com/cloud/answer/7454865) and
+[Exceptions to verification requirements](https://support.google.com/cloud/answer/13464323)
+(checked 2026-10-17).
+
 ## When a job fails
 
 Check the failed run's logs in the Actions tab first; every pipeline script
@@ -168,9 +289,14 @@ logs at `INFO` level with timestamps. Common causes:
   from `daily_state.py` (a body that is not the OE CSV, titled for example
   "Google Drive - Quota exceeded"). With `GOOGLE_DRIVE_API_KEY` set, a warning
   `OE 2026: Drive API quota exceeded (HTTP 403: ...) - retrying via the public link`
-  comes first (for the listing:
+  comes first (`... - retrying via a copy in your Drive` with the OAuth
+  secrets set, then `OE 2026: copy route failed: ... - retrying via the public link`
+  if the copy route fails too; for the listing:
   `OE folder: Drive API quota exceeded (HTTP 429: ...) - retrying via the public folder view`);
-  the error is only raised when the public link is blocked too.
+  the error is only raised when the public link is blocked too, and then ends
+  with `(tried the Drive API, a copy in your Drive, the public link)`. With
+  the OAuth secrets but no key, a blocked public link logs `OE 2026: public
+  link failed: ... - retrying via a copy in your Drive` instead.
   Consequences: the state is not updated, the
   Daily Evaluate run shows as failed, `evaluate` and `predict` still ran
   (predict on the committed state). **Do nothing**: the next day's run catches
@@ -193,6 +319,27 @@ logs at `INFO` level with timestamps. Common causes:
   `Location`, or a second time; the key was not sent there. There is no
   fallback: check whether Drive changed its download flow, or delete the
   secret to go back to the public links.
+- **Copy route (OAuth) problem.** Any copy-route failure (including an
+  unexpected Drive response) only logs `OE 2026: copy route failed: ... -
+  retrying via the public link` (without the API key the copy is the last
+  route, so its error is raised, ending with `(tried the public link, a copy
+  in your Drive)`). `Google
+  OAuth: the refresh token in GOOGLE_OAUTH_REFRESH_TOKEN is expired or revoked
+  (invalid_grant)`: the token was revoked, unused for six months, or issued
+  while the app was still in "Testing" (7-day expiry). Check that the app is
+  **In production**, re-run `src/scripts/google_oauth_token.py` and replace the
+  secret ([Setting up the copy-to-Drive fallback](#setting-up-the-copy-to-drive-fallback-oauth)).
+  `Google OAuth token request failed (HTTP 401: invalid_client ...)`: the
+  client id or secret is wrong or the client was deleted; fix the two secrets.
+  `Drive API error (HTTP 403: ... insufficient ... scopes)`: the token lacks
+  the `drive` scope; add it under Data Access and re-run the helper.
+  `OE copy route off: GOOGLE_OAUTH_... not set`: only some of the three
+  secrets are set. `OE: could not delete the temporary Drive copy <id>`: the
+  run went on; the copy (~78 MB) uses your Drive storage until a copy run at
+  least 2 hours later deletes it, or delete `riftside-oracle tmp OE <year>` by
+  hand in your Drive (and empty it from the bin). `OE: temporary Drive copy
+  <id> was not found on delete (HTTP 404)`: harmless, the copy is already
+  gone. `oe.py --check` tests the token and exits 1 while it fails.
 - **Unmapped team.** Log: `unmapped team <code>/<name>` (and `unmapped team,
   skipped` for the match); the match gets no prediction. Add a row to
   `src/pipeline/team_aliases.csv`:
@@ -249,7 +396,7 @@ gh workflow enable keepalive.yml      --repo IcaruzSoftware/riftside-oracle
 ## Checking the sources
 
 ```bash
-python src/pipeline/oe.py --check          # says Drive API vs public link, lists the Drive folder, starts a real download of the latest year, prints status / size / latency
+python src/pipeline/oe.py --check          # says Drive API vs public link and whether the copy route is configured (tests its token), lists the Drive folder, starts a real download of the latest year, prints status / size / latency and the route that delivered it
 python src/pipeline/lolesports.py --check  # getLeagues; requires lck, lpl, lec, worlds
 ```
 

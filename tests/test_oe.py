@@ -104,7 +104,8 @@ class _Resp:
 @pytest.fixture(autouse=True)
 def _no_api_key(monkeypatch):
     """Tests default to the public-link path, whatever the local environment has set."""
-    monkeypatch.delenv("GOOGLE_DRIVE_API_KEY", raising=False)
+    for env in ("GOOGLE_DRIVE_API_KEY", *oe.OAUTH_ENV.values()):
+        monkeypatch.delenv(env, raising=False)
 
 
 def test_download_year_skips_fresh_file(tmp_path, monkeypatch):
@@ -296,3 +297,310 @@ def test_list_files_empty_api_listing_says_so(monkeypatch):
     _fake_get(monkeypatch, {oe.API_FILES_URL: _ApiResp(payload={"files": []})})
     with pytest.raises(RuntimeError, match="Drive API listing returned no OE files"):
         oe.list_files()
+
+
+# ---------------------------------------------------------------------------
+# Copy-to-own-Drive route (GOOGLE_OAUTH_*), after an API quota error
+# ---------------------------------------------------------------------------
+
+CLIENT_ID, CLIENT_SECRET, REFRESH = "cid-DUMMY-7f3a", "csecret-DUMMY-91b2", "refresh-DUMMY-c4d8"
+ACCESS = "access-DUMMY-55e1"
+SECRETS = (KEY, CLIENT_SECRET, REFRESH, ACCESS)
+OAUTH = {"GOOGLE_OAUTH_CLIENT_ID": CLIENT_ID, "GOOGLE_OAUTH_CLIENT_SECRET": CLIENT_SECRET,
+         "GOOGLE_OAUTH_REFRESH_TOKEN": REFRESH}
+BEARER = {"Authorization": f"Bearer {ACCESS}"}
+API = oe.API_FILES_URL
+SWEEP_Q = ("appProperties has { key='riftsideOracleTmp' and value='1' } and 'me' in owners "
+           "and trashed=false")
+TAG = {"riftsideOracleTmp": "1"}
+OLD = "2026-10-17T01:00:00.000Z"        # > 2 h before NOW
+NOW = oe.datetime(2026, 10, 17, 7, 45, tzinfo=oe.timezone.utc)
+
+
+def _copy_route(over=None, fid="fid"):
+    """Responses by (method, url): API quota, then token, empty sweep, copy, copy download, delete."""
+    return {("GET", f"{API}/{fid}"): _ApiResp(status=403, payload=QUOTA),
+            ("POST", oe.TOKEN_URL): _ApiResp(payload={"access_token": ACCESS, "expires_in": 3599}),
+            ("GET", API): _ApiResp(payload={"files": []}),
+            ("POST", f"{API}/{fid}/copy"): _ApiResp(payload={"id": "cid"}),
+            ("GET", f"{API}/cid"): _ApiResp(CSV),
+            ("DELETE", f"{API}/cid"): _ApiResp(status=204),
+            ("GET", oe.DOWNLOAD_URL.format(file_id=fid)): _ApiResp(CSV),
+            **(over or {})}
+
+
+def _fake_http(monkeypatch, responses, oauth=OAUTH):
+    """Set the key + OAuth env; stub requests.get/post/delete, recording (method, url, kwargs).
+    A response may be a callable(kwargs) -> response."""
+    monkeypatch.setenv("GOOGLE_DRIVE_API_KEY", KEY)
+    for env, value in oauth.items():
+        monkeypatch.setenv(env, value)
+    calls = []
+
+    def stub(method):
+        def call(url, **kwargs):
+            calls.append((method, url, kwargs))
+            r = responses[(method, url)]
+            return r(kwargs) if callable(r) else r
+        return call
+    for method in ("get", "post", "delete"):
+        monkeypatch.setattr(oe.requests, method, stub(method.upper()))
+    return calls
+
+
+def _routes(calls):
+    return [(m, u) for m, u, _ in calls]
+
+
+def _assert_no_secrets(calls, *texts):
+    urls = str([(u, kw.get("params"), kw.get("json")) for _, u, kw in calls])
+    for secret in SECRETS:
+        assert all(secret not in t for t in (urls, *texts))
+
+
+def test_copy_route_after_api_quota(tmp_path, monkeypatch, caplog):
+    caplog.set_level("INFO", logger="pipeline.oe")
+    calls = _fake_http(monkeypatch, _copy_route())
+    path = oe.download_year(2026, tmp_path, file_id="fid")
+    assert path.read_bytes() == CSV and list(tmp_path.iterdir()) == [path]   # atomic, no .part
+    assert _routes(calls) == [("GET", f"{API}/fid"), ("POST", oe.TOKEN_URL), ("GET", API),
+                              ("POST", f"{API}/fid/copy"), ("GET", f"{API}/cid"),
+                              ("DELETE", f"{API}/cid")]
+    token, sweep, copy, media, delete = (kw for _, _, kw in calls[1:])
+    assert token["data"] == {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
+                             "refresh_token": REFRESH, "grant_type": "refresh_token"}
+    assert "headers" not in token and token["allow_redirects"] is False
+    assert sweep["params"] == {"q": SWEEP_Q, "fields": "files(id,name,createdTime,appProperties)"}
+    assert copy["params"] == {"supportsAllDrives": "true", "fields": "id"}
+    assert copy["json"] == {"name": "riftside-oracle tmp OE 2026", "parents": ["root"],
+                            "appProperties": TAG}
+    assert media["params"] == {"alt": "media"}
+    assert all(kw["headers"] == BEARER and kw["allow_redirects"] is False
+               for kw in (sweep, copy, media, delete))
+    assert "retrying via a copy in your Drive" in caplog.text
+    assert "via a copy in your Drive" in caplog.records[-1].getMessage()
+    _assert_no_secrets(calls, caplog.text)
+
+
+@pytest.mark.parametrize("oauth, missing", [
+    ({}, None),
+    ({"GOOGLE_OAUTH_CLIENT_ID": CLIENT_ID, "GOOGLE_OAUTH_REFRESH_TOKEN": " \n"},
+     "GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REFRESH_TOKEN"),
+    ({**OAUTH, "GOOGLE_OAUTH_CLIENT_SECRET": ""}, "GOOGLE_OAUTH_CLIENT_SECRET"),
+])
+def test_copy_route_off_without_all_creds(tmp_path, monkeypatch, caplog, oauth, missing):
+    calls = _fake_http(monkeypatch, _copy_route(), oauth)
+    assert oe.download_year(2026, tmp_path, file_id="fid").read_bytes() == CSV
+    assert _routes(calls) == [("GET", f"{API}/fid"), ("GET", oe.DOWNLOAD_URL.format(file_id="fid"))]
+    assert "retrying via the public link" in caplog.text
+    if missing:
+        assert f"OE copy route off: {missing} not set" in caplog.text
+    else:
+        assert "copy route" not in caplog.text
+    assert CLIENT_ID not in caplog.text
+    _assert_no_secrets(calls, caplog.text)
+
+
+def test_invalid_grant_is_clear_and_falls_back_to_public_link(tmp_path, monkeypatch, caplog):
+    calls = _fake_http(monkeypatch, _copy_route({("POST", oe.TOKEN_URL): _ApiResp(
+        status=400, payload={"error": "invalid_grant",
+                             "error_description": "Token has been expired or revoked."})}))
+    assert oe.download_year(2026, tmp_path, file_id="fid").read_bytes() == CSV
+    assert _routes(calls) == [("GET", f"{API}/fid"), ("POST", oe.TOKEN_URL),   # no token retry
+                              ("GET", oe.DOWNLOAD_URL.format(file_id="fid"))]
+    assert "expired or revoked (invalid_grant)" in caplog.text
+    assert "re-run src/scripts/google_oauth_token.py" in caplog.text
+    _assert_no_secrets(calls, caplog.text)
+
+
+@pytest.mark.parametrize("oauth, tried", [
+    (OAUTH, "the Drive API, a copy in your Drive, the public link"),
+    ({}, "the Drive API, the public link"),
+])
+def test_all_routes_blocked_raise_error_naming_routes(tmp_path, monkeypatch, caplog, oauth, tried):
+    calls = _fake_http(monkeypatch, _copy_route({
+        ("POST", oe.TOKEN_URL): _ApiResp(status=401, payload={
+            "error": "invalid_client", "error_description": "The OAuth client was not found."}),
+        ("GET", oe.DOWNLOAD_URL.format(file_id="fid")): _ApiResp(QUOTA_PAGE)}), oauth)
+    with pytest.raises(RuntimeError, match=rf"Quota exceeded' \(tried {tried}\)") as exc:
+        oe.download_year(2026, tmp_path, file_id="fid")
+    if oauth:
+        assert "HTTP 401: invalid_client: The OAuth client was not found." in caplog.text
+    assert list(tmp_path.iterdir()) == []
+    _assert_no_secrets(calls, str(exc.value), caplog.text)
+
+
+@pytest.mark.parametrize("blocked, routes", [
+    (("POST", f"{API}/fid/copy"), ["copy"]),
+    (("GET", f"{API}/cid"), ["copy", "media", "delete"]),        # the copy is still deleted
+])
+def test_copy_quota_falls_back_to_public_link(tmp_path, monkeypatch, caplog, blocked, routes):
+    calls = _fake_http(monkeypatch, _copy_route({blocked: _ApiResp(status=403, payload=QUOTA)}))
+    assert oe.download_year(2026, tmp_path, file_id="fid").read_bytes() == CSV
+    step = {"copy": ("POST", f"{API}/fid/copy"), "media": ("GET", f"{API}/cid"),
+            "delete": ("DELETE", f"{API}/cid")}
+    assert _routes(calls) == [("GET", f"{API}/fid"), ("POST", oe.TOKEN_URL), ("GET", API),
+                              *(step[r] for r in routes),
+                              ("GET", oe.DOWNLOAD_URL.format(file_id="fid"))]
+    assert "copy route failed: Drive API quota exceeded" in caplog.text
+    assert "headers" not in calls[-1][2]                 # no credential to the public link
+    _assert_no_secrets(calls, caplog.text)
+
+
+def test_copy_delete_failure_only_warns(tmp_path, monkeypatch, caplog):
+    calls = _fake_http(monkeypatch, _copy_route({("DELETE", f"{API}/cid"): _ApiResp(
+        status=500, payload={"error": {"message": "Backend Error"}})}))
+    assert oe.download_year(2026, tmp_path, file_id="fid").read_bytes() == CSV
+    assert "could not delete the temporary Drive copy cid" in caplog.text
+    _assert_no_secrets(calls, caplog.text)
+
+
+def _stale(fid, name="riftside-oracle tmp OE 2025", created=OLD, props=TAG):
+    f = {"id": fid, "name": name, "createdTime": created}
+    return f if props is None else {**f, "appProperties": props}
+
+
+def test_stale_copies_are_swept_before_copying(tmp_path, monkeypatch):
+    class _Now(oe.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW
+    monkeypatch.setattr(oe, "datetime", _Now)
+    calls = _fake_http(monkeypatch, _copy_route({
+        ("GET", API): _ApiResp(payload={"files": [
+            _stale("old1"),
+            _stale("old2", name="riftside-oracle tmp OE 2026", created="2026-10-17T05:44:59Z"),
+            _stale("young", created="2026-10-17T06:00:00.000Z"),     # a concurrent run's copy
+            _stale("other", name="riftside-oracle tmp OE 2026 notes"),
+            _stale("prefix", name="riftside-oracle tmp OEx 2026"),
+            _stale("untagged", props=None),
+            _stale("wrongtag", props={"riftsideOracleTmp": "0"}),
+            _stale("nodate", created=None),
+            {"name": "riftside-oracle tmp OE 2024"}, "junk"]}),
+        ("DELETE", f"{API}/old1"): _ApiResp(status=204),
+        ("DELETE", f"{API}/old2"): _ApiResp(status=204)}))
+    oe.download_year(2026, tmp_path, file_id="fid")
+    assert _routes(calls)[2:6] == [("GET", API), ("DELETE", f"{API}/old1"),
+                                   ("DELETE", f"{API}/old2"), ("POST", f"{API}/fid/copy")]
+    assert [u for m, u, _ in calls if m == "DELETE"] == [f"{API}/old1", f"{API}/old2", f"{API}/cid"]
+    assert all(kw["headers"] == BEARER for m, _, kw in calls if m == "DELETE")
+
+
+@pytest.mark.parametrize("over", [
+    {("GET", API): _ApiResp(b"<html>oops</html>")},                  # sweep: not JSON
+    {("GET", API): _ApiResp(b"[1, 2]")},                             # sweep: not an object
+    {("POST", f"{API}/fid/copy"): _ApiResp(b"null")},                # copy: not an object
+    {("POST", f"{API}/fid/copy"): _ApiResp(payload={"kind": "drive#file"})},   # copy: no id
+    {("POST", f"{API}/fid/copy"): _ApiResp(payload={"id": 5})},
+])
+def test_malformed_copy_route_bodies_fall_back_to_public_link(tmp_path, monkeypatch, caplog, over):
+    calls = _fake_http(monkeypatch, _copy_route(over))
+    assert oe.download_year(2026, tmp_path, file_id="fid").read_bytes() == CSV
+    assert "copy route failed: Drive API: " in caplog.text
+    assert _routes(calls)[-1] == ("GET", oe.DOWNLOAD_URL.format(file_id="fid"))
+    assert ("DELETE", f"{API}/cid") not in _routes(calls)
+
+
+def test_sweep_with_malformed_files_list_still_copies(tmp_path, monkeypatch):
+    calls = _fake_http(monkeypatch, _copy_route({("GET", API): _ApiResp(payload={"files": "x"})}))
+    oe.download_year(2026, tmp_path, file_id="fid")
+    assert ("POST", f"{API}/fid/copy") in _routes(calls)
+
+
+def test_copy_delete_404_has_neutral_message(tmp_path, monkeypatch, caplog):
+    _fake_http(monkeypatch, _copy_route({("DELETE", f"{API}/cid"): _ApiResp(
+        status=404, payload={"error": {"message": "File not found: cid."}})}))
+    oe.download_year(2026, tmp_path, file_id="fid")
+    assert "temporary Drive copy cid was not found on delete (HTTP 404)" in caplog.text
+    assert "not public" not in caplog.text
+
+
+@pytest.mark.parametrize("key, oauth, order", [
+    (KEY, OAUTH, ["the Drive API", "a copy in your Drive", "the public link"]),
+    (KEY, {}, ["the Drive API", "the public link"]),
+    (None, OAUTH, ["the public link", "a copy in your Drive"]),
+    (None, {}, ["the public link"]),
+])
+def test_route_order(monkeypatch, key, oauth, order):
+    for env, value in oauth.items():
+        monkeypatch.setenv(env, value)
+    assert oe.route_order(key, oe.oauth_credentials()) == order
+
+
+def test_oauth_without_key_tries_copy_after_public_link(tmp_path, monkeypatch, caplog):
+    calls = _fake_http(monkeypatch, _copy_route({
+        ("GET", oe.DOWNLOAD_URL.format(file_id="fid")): _ApiResp(QUOTA_PAGE)}))
+    monkeypatch.delenv("GOOGLE_DRIVE_API_KEY")
+    assert oe.download_year(2026, tmp_path, file_id="fid").read_bytes() == CSV
+    assert _routes(calls) == [("GET", oe.DOWNLOAD_URL.format(file_id="fid")),
+                              ("POST", oe.TOKEN_URL), ("GET", API), ("POST", f"{API}/fid/copy"),
+                              ("GET", f"{API}/cid"), ("DELETE", f"{API}/cid")]
+    assert ("public link failed: OE 2026: download fid is not the OE CSV: 'Google Drive - Quota "
+            "exceeded' - retrying via a copy in your Drive") in caplog.text
+    _assert_no_secrets(calls, caplog.text)
+
+
+def test_oauth_without_key_all_blocked_names_routes(tmp_path, monkeypatch, caplog):
+    calls = _fake_http(monkeypatch, _copy_route({
+        ("GET", oe.DOWNLOAD_URL.format(file_id="fid")): _ApiResp(QUOTA_PAGE),
+        ("POST", f"{API}/fid/copy"): _ApiResp(status=403, payload=QUOTA)}))
+    monkeypatch.delenv("GOOGLE_DRIVE_API_KEY")
+    with pytest.raises(RuntimeError, match=r"Drive API quota exceeded .*\(tried the public link, "
+                                           r"a copy in your Drive\)") as exc:
+        oe.download_year(2026, tmp_path, file_id="fid")
+    assert list(tmp_path.iterdir()) == []
+    _assert_no_secrets(calls, str(exc.value), caplog.text)
+
+
+def test_copy_redirect_is_followed_without_authorization(tmp_path, monkeypatch, caplog):
+    calls = _fake_http(monkeypatch, _copy_route({
+        ("GET", f"{API}/cid"): _ApiResp(status=302, location=MEDIA),
+        ("GET", MEDIA): _ApiResp(CSV)}))
+    assert oe.download_year(2026, tmp_path, file_id="fid").read_bytes() == CSV
+    (_, _, kwargs), = [c for c in calls if c[1] == MEDIA]
+    assert "headers" not in kwargs and kwargs["allow_redirects"] is False
+    _assert_no_secrets(calls, caplog.text)
+
+
+def _check_responses(over=None):
+    """check(): the API listing (key) and the sweep (Bearer) share the files URL."""
+    def listing(kw):
+        return _ApiResp(payload=LISTING if "X-Goog-Api-Key" in kw["headers"] else {"files": []})
+    return _copy_route({("GET", API): listing, **(over or {})}, fid="id2026")
+
+
+def test_check_reports_copy_route(monkeypatch, capsys):
+    calls = _fake_http(monkeypatch, _check_responses())
+    assert oe.check() == 0
+    out = capsys.readouterr()
+    assert "copy      configured (GOOGLE_OAUTH_* set), access token OK" in out.out
+    assert "routes    the Drive API -> a copy in your Drive -> the public link" in out.out
+    assert "OK - OE folder and 2026 download work (via a copy in your Drive)." in out.out
+    _assert_no_secrets(calls, out.out, out.err)
+
+
+def test_check_reports_bad_oauth_without_values(monkeypatch, capsys):
+    calls = _fake_http(monkeypatch, _check_responses({
+        ("POST", oe.TOKEN_URL): _ApiResp(status=401, payload={"error": "invalid_client"}),
+        ("GET", f"{API}/id2026"): _ApiResp(CSV)}))
+    assert oe.check() == 1
+    out = capsys.readouterr()
+    assert "but Google OAuth token request failed (HTTP 401: invalid_client)" in out.out
+    assert "download works (via the Drive API), but the copy route does not" in out.out
+    assert "routes    the Drive API -> the public link" in out.out
+    assert _routes(calls).count(("POST", oe.TOKEN_URL)) == 1
+    _assert_no_secrets(calls, out.out, out.err)
+
+
+def test_check_oauth_without_key(monkeypatch, capsys):
+    html = _entry("id2026", "2026_LoL_esports_match_data_from_OraclesElixir.csv").encode()
+    calls = _fake_http(monkeypatch, _copy_route({
+        ("GET", oe.FOLDER_URL): _ApiResp(html),
+        ("GET", oe.DOWNLOAD_URL.format(file_id="id2026")): _ApiResp(QUOTA_PAGE)}, fid="id2026"))
+    monkeypatch.delenv("GOOGLE_DRIVE_API_KEY")
+    assert oe.check() == 0
+    out = capsys.readouterr()
+    assert "routes    the public link -> a copy in your Drive" in out.out
+    assert "download  public link failed: " in out.out
+    assert "OK - OE folder and 2026 download work (via a copy in your Drive)." in out.out
+    _assert_no_secrets(calls, out.out, out.err)
